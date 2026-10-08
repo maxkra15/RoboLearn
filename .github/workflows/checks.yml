@@ -1,0 +1,26 @@
+name: Checks
+
+on: [push, pull_request]
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v10
+      - name: Install CPU test dependencies
+        run: |
+          uv venv
+          uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install -e '.[flashsac]' pytest ruff build
+      - name: Lint
+        run: |
+          uv run --no-sync ruff check .
+          uv run --no-sync ruff format --check .
+      - name: FlashSAC and adapter tests
+        run: uv run --no-sync pytest -q tests/test_flashsac.py tests/test_isaaclab_adapter.py
+      - name: Build distribution
+        run: uv run --no-sync python -m build

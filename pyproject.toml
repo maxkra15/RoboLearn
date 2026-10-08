@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "robolearn-rl"
+version = "0.1.0"
+description = "Small reinforcement learning implementations for GPU robot simulation."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE", "licenses/*.txt"]
+authors = [{name = "RoboLearn contributors"}]
+dependencies = ["numpy>=1.26"]
+
+[project.optional-dependencies]
+flashsac = ["torch>=2.5", "gymnasium>=1.1"]
+warp = ["warp-nn>=0.4.0,<0.5", "warp-lang>=1.15"]
+mujoco = ["mujoco>=3.12,<4", "mujoco-warp>=3.12,<4"]
+
+[project.urls]
+Homepage = "https://github.com/maxkra15/RoboLearn"
+Repository = "https://github.com/maxkra15/RoboLearn"
+Issues = "https://github.com/maxkra15/RoboLearn/issues"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.9", "build>=1.2"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/robolearn"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

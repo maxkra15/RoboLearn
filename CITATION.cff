@@ -1,0 +1,57 @@
+cff-version: 1.2.0
+message: "Please cite the original algorithm papers in CITATIONS.bib when using RoboLearn in research."
+title: RoboLearn
+type: software
+authors:
+  - name: RoboLearn contributors
+version: 0.1.0
+license: MIT
+repository-code: "https://github.com/maxkra15/RoboLearn"
+url: "https://github.com/maxkra15/RoboLearn"
+references:
+  - type: article
+    title: "FlashSAC: Fast and Stable Off-Policy Reinforcement Learning for High-Dimensional Robot Control"
+    authors:
+      - family-names: Kim
+        given-names: Donghu
+      - family-names: Lee
+        given-names: Youngdo
+      - family-names: Park
+        given-names: Minho
+      - family-names: Kim
+        given-names: Kinam
+      - family-names: Nahendra
+        given-names: I Made Aswin
+      - family-names: Seno
+        given-names: Takuma
+      - family-names: Min
+        given-names: Sehee
+      - family-names: Palenicek
+        given-names: Daniel
+      - family-names: Vogt
+        given-names: Florian
+      - family-names: Kragic
+        given-names: Danica
+      - family-names: Peters
+        given-names: Jan
+      - family-names: Choo
+        given-names: Jaegul
+      - family-names: Lee
+        given-names: Hojoon
+    year: 2026
+    doi: "10.48550/arXiv.2604.04539"
+  - type: article
+    title: Proximal Policy Optimization Algorithms
+    authors:
+      - family-names: Schulman
+        given-names: John
+      - family-names: Wolski
+        given-names: Filip
+      - family-names: Dhariwal
+        given-names: Prafulla
+      - family-names: Radford
+        given-names: Alec
+      - family-names: Klimov
+        given-names: Oleg
+    year: 2017
+    doi: "10.48550/arXiv.1707.06347"
