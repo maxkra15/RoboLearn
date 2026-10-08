@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added an opt-in experimental actor/critic prototype using short differentiable
+  physics rollouts, frozen critic input derivatives, and detached n-step targets.
 - Added opt-in tiled Linear gradients for Warp PPO, using split-batch parameter
   reductions while preserving Warp-NN forward layers and checkpoint format.
 

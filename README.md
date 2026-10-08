@@ -61,6 +61,13 @@ a WarpNN port and comparative speed benchmarks remain future work.
 See [initial validation results](docs/validation.md) for the Isaac Lab drawer
 run, checkpoint playback, and CUDA capture checks.
 
+### Experimental physics gradients
+
+An opt-in [short-horizon pathwise actor/critic prototype](docs/differentiable.md)
+connects simulator derivatives to policy parameters. It is inspired by SHAC and
+requires a separate differentiable environment adapter. It is not a full SHAC
+reproduction, and current released MuJoCo Warp does not provide its physics adjoint.
+
 ## Credits
 
 **FlashSAC** — Donghu Kim, Youngdo Lee, Minho Park, Kinam Kim, I Made Aswin Nahendra,

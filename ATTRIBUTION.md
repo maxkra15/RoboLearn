@@ -52,6 +52,24 @@ The Warp PPO implementation is original RoboLearn code implementing:
 It uses the clipped PPO objective and GAE. Numerical references and capture tests
 are provided; this implementation is not a port of RSL-RL source code.
 
+## Experimental short-horizon actor/critic
+
+`src/robolearn/warp/experimental.py` is original RoboLearn code inspired by SHAC:
+Jie Xu, Viktor Makoviychuk, Yashraj Narang, Fabio Ramos, Wojciech Matusik,
+Animesh Garg, and Miles Macklin,
+[*Accelerated Policy Learning with Parallel Differentiable Simulation*](https://arxiv.org/abs/2204.07137), 2022.
+
+It implements a deterministic pathwise actor with short physics rollouts and
+critic bootstrapping, plus detached n-step critic targets. It does not reproduce
+the complete published SHAC method. No code is copied from SHAC implementations.
+
+The Isaac Lab prototype uses the unmerged MuJoCo Warp
+[hybrid analytic differentiability implementation](https://github.com/google-deepmind/mujoco_warp/pull/1535),
+commit `357a75d60a56d67d476942a1b6e54b3045ee8e87`, developed upstream by Eliot Xing,
+Eric Heiden, Miles Macklin, and project contributors. It remains an Apache-2.0
+dependency and is not vendored here.
+This adjoint must not be described as a capability of released MuJoCo Warp.
+
 ## Dependencies and project structure
 
 [WarpNN](https://github.com/NVIDIA/warp-nn) and
