@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Added opt-in tiled Linear gradients for Warp PPO, using split-batch parameter
+  reductions while preserving Warp-NN forward layers and checkpoint format.
+
 ## 0.1.0
 
 - Packaged the authors' PyTorch FlashSAC implementation with a tensor API and

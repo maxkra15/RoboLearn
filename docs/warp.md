@@ -77,6 +77,21 @@ device kernels for rewards and resets. Call `wp.capture_launch` to replay.
 `agent.warmup()` prepares the learning part without changing optimizer state;
 environment/inference kernels still need their own warmup.
 
+## Optional tiled network gradients
+
+Set `PPOConfig(optimized_linear_backward=True)` to replace Warp-NN's generated
+Linear backward with separate tiled input-gradient and weight-gradient products.
+Weight gradients use fixed split-batch partial buffers and reductions. Forward
+layers, activations, PPO losses, Adam, and checkpoint keys stay compatible.
+The default retains Warp-NN's generated backward for comparisons.
+
+This path uses Warp-NN 0.4 layer caches and Warp's tape callbacks. Its persistent
+scratch buffers are prepared before capture. Numerical diagnostics compare
+FP32 reference gradients, complete PPO updates, and eager versus captured replay;
+floating-point reduction order can change results slightly. Measure the complete
+training workload before selecting it: graph capture and custom kernels do not
+guarantee faster matrix multiplication than optimized Torch backends.
+
 Capturing the whole Isaac Lab `env.step()` requires its observation, reward,
 event, reset, and bookkeeping paths to support capture. This library demonstrates
 joint capture with direct MuJoCo Warp; it does not claim generic joint capture

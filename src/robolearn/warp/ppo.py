@@ -32,6 +32,7 @@ class PPOConfig:
     normalize_advantages: bool = True
     clip_value: bool = True
     seed: int = 42
+    optimized_linear_backward: bool = False
 
 
 @wp.kernel(enable_backward=False)
@@ -199,11 +200,23 @@ def _make_ppo_loss(action_dim: int):
     return loss_kernel
 
 
-def _mlp(input_dim: int, output_dim: int, hidden_dims: tuple[int, ...], rng: np.random.Generator) -> nn.Sequential:
+def _mlp(
+    input_dim: int,
+    output_dim: int,
+    hidden_dims: tuple[int, ...],
+    rng: np.random.Generator,
+    optimized_linear_backward: bool = False,
+) -> nn.Sequential:
+    if optimized_linear_backward:
+        from ._linear import TiledLinear
+
+        linear = TiledLinear
+    else:
+        linear = nn.Linear
     layers = []
     widths = (input_dim, *hidden_dims, output_dim)
     for index, (in_dim, out_dim) in enumerate(zip(widths[:-1], widths[1:], strict=True)):
-        layer = nn.Linear(in_dim, out_dim, initialize_parameters=False)
+        layer = linear(in_dim, out_dim, initialize_parameters=False)
         # Simulation callers may disable Warp differentiation globally. Enable
         # it only for the Warp-NN kernels used by this network.
         if not layer._kernel.module.options["enable_backward"]:
@@ -253,8 +266,10 @@ class WarpPPO:
         self.batch_size = num_envs * horizon
         rng = np.random.default_rng(self.config.seed)
         with wp.ScopedDevice(self.device):
-            self.actor = _mlp(observation_dim, action_dim, self.config.hidden_dims, rng)
-            self.critic = _mlp(observation_dim, 1, self.config.hidden_dims, rng)
+            self.actor = _mlp(
+                observation_dim, action_dim, self.config.hidden_dims, rng, self.config.optimized_linear_backward
+            )
+            self.critic = _mlp(observation_dim, 1, self.config.hidden_dims, rng, self.config.optimized_linear_backward)
             self.log_std = wp.full(action_dim, math.log(self.config.initial_std), dtype=wp.float32, requires_grad=True)
             self.parameters = self.actor.parameters() + self.critic.parameters() + [self.log_std]
             self.optimizer = optimizers.Adam(
