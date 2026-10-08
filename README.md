@@ -58,6 +58,9 @@ The initial PPO implementation supports state observations on one GPU. A
 collection, and PPO updates in one graph. FlashSAC currently uses PyTorch;
 a WarpNN port and comparative speed benchmarks remain future work.
 
+See [initial validation results](docs/validation.md) for the Isaac Lab drawer
+run, checkpoint playback, and CUDA capture checks.
+
 ## Credits
 
 **FlashSAC** — Donghu Kim, Youngdo Lee, Minho Park, Kinam Kim, I Made Aswin Nahendra,
