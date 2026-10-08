@@ -97,7 +97,8 @@ def test_checkpoint_restores_policy_with_different_environment_count(tmp_path, n
     observations = torch.randn(4, 3)
     _collect(agent, observations)
     agent.update()
-    expected = agent.act(observations, training=False)[:2].clone()
+    # Match the forward batch shape so this checks reload rather than CPU GEMM rounding.
+    expected = agent.act(observations[:2], training=False).clone()
     checkpoint = str(tmp_path / "agent")
     agent.save(checkpoint)
 
