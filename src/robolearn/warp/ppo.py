@@ -152,7 +152,7 @@ def _normalize(advantages: wp.array(dtype=wp.float32), stats: wp.array(dtype=wp.
 def _make_ppo_loss(action_dim: int):
     # Unroll the distribution sum: Warp's backward replay must retain the
     # accumulated log probability used by clipping after the action loop.
-    @wp.kernel
+    @wp.kernel(enable_backward=True, module="unique")
     def loss_kernel(
         mean: wp.array2d(dtype=wp.float32),
         values: wp.array2d(dtype=wp.float32),
@@ -193,6 +193,9 @@ def _make_ppo_loss(action_dim: int):
         wp.atomic_add(metrics, 1, scale * value_loss)
         wp.atomic_add(metrics, 2, scale * entropy)
 
+    # wp.static is resolved before Warp checks max_unroll. Without this
+    # override, larger action spaces still generate a dynamic backward loop.
+    wp.set_module_options({"max_unroll": max(action_dim, wp.config.max_unroll)}, module=loss_kernel.module)
     return loss_kernel
 
 
@@ -201,12 +204,20 @@ def _mlp(input_dim: int, output_dim: int, hidden_dims: tuple[int, ...], rng: np.
     widths = (input_dim, *hidden_dims, output_dim)
     for index, (in_dim, out_dim) in enumerate(zip(widths[:-1], widths[1:], strict=True)):
         layer = nn.Linear(in_dim, out_dim, initialize_parameters=False)
+        # Simulation callers may disable Warp differentiation globally. Enable
+        # it only for the Warp-NN kernels used by this network.
+        if not layer._kernel.module.options["enable_backward"]:
+            wp.set_module_options({"enable_backward": True}, module=layer._kernel.module)
         bound = 1.0 / math.sqrt(in_dim)
         for parameter in (layer.weight.data, layer.bias.data):
             parameter.assign(rng.uniform(-bound, bound, parameter.shape).astype(np.float32))
         layers.append(layer)
         if index < len(hidden_dims):
-            layers.append(nn.Tanh())
+            activation = nn.Tanh()
+            for kernel in activation._kernels.values():
+                if not kernel.module.options["enable_backward"]:
+                    wp.set_module_options({"enable_backward": True}, module=kernel.module)
+            layers.append(activation)
     return nn.Sequential(*layers)
 
 
