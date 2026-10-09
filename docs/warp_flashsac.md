@@ -109,6 +109,9 @@ trajectories and assess native parameter health and common policy evaluations.
 
 ## Initial Cartpole comparison
 
+The [public Cartpole report](https://maxkra15.github.io/reports/2026-10-09-cartpole-flashsac/)
+presents policy curves, seed outcomes, timing, and downloadable measurements.
+
 The retrieved 12-run cohort passed SHA256 verification and audits of its native
 checkpoints, optimizer state, budgets, shared initial fixtures, and evaluations.
 The original comparison JSON remains unchanged; its SHA256 is
@@ -164,3 +167,13 @@ The measured working snapshot reports package version 0.2.0 and includes the
 unreleased Warp backend. Candidate 0.3.0 packages that API with updated release
 metadata. Reproduction depends on the recorded source hashes and recipe, rather
 than the version label alone.
+
+### Learner profiling
+
+The [profiling appendix](https://maxkra15.github.io/reports/2026-10-09-cartpole-flashsac/#profiling)
+measures a warmed synthetic learner with Cartpole dimensions. Captured controls
+averaged 32.2668 ms per update, versus 32.6471 ms for eager execution, a 1.16%
+reduction. Linear algebra accounted for 69.3% and normalization for 14.0% of
+sampled eager GPU activity. These percentages rank eager work; captured graph
+node shares and optimization gains were not measured. This diagnostic does not
+establish the cause of the training differences.

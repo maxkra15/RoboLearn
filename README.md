@@ -53,6 +53,11 @@ arrays and captures replay sampling and learning updates. Start with FP32 to che
 numerical fidelity; mixed precision is not implemented. See the
 [Warp FlashSAC guide](docs/warp_flashsac.md) for scope and validation status.
 
+The [Cartpole report](https://maxkra15.github.io/reports/2026-10-09-cartpole-flashsac/)
+compares four Torch and Warp recipes with three seeds each. Its
+[profiling appendix](https://maxkra15.github.io/reports/2026-10-09-cartpole-flashsac/#profiling)
+examines synthetic learner timings separately from the training results.
+
 ## WarpNN PPO
 
 See [the Warp guide](docs/warp.md) and [capture example](examples/warp_ppo_graph.py).
