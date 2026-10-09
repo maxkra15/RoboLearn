@@ -11,6 +11,8 @@
   policies, preserving FlashSAC's default normalized action bounds.
 - Added an opt-in detached device-tensor metric result to the adapted FlashSAC
   update API, allowing callers to defer host scalar reads until logging.
+- Preserve compiled FlashSAC exploration state and returned actions across
+  subsequent CUDA graph invocations using independently owned tensor storage.
 - Added opt-in tiled Linear gradients for Warp PPO, using split-batch parameter
   reductions while preserving Warp-NN forward layers and checkpoint format.
 

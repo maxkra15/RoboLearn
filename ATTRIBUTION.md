@@ -33,6 +33,7 @@ Adaptations in this extraction:
 - Added an Isaac Lab 3 adapter with pre-reset terminal observations.
 - Added an optional detached device-tensor metric result for deferred logging;
   the authors' network updates and default Python-float result are retained.
+- Preserve exploration state and action storage across compiled graph invocations.
 
 RoboLearn's checkpoints support weight and optimizer resume. Replay saving is
 optional, and pending n-step transitions, exploration noise, and RNG state are

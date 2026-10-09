@@ -502,6 +502,14 @@ class FlashSAC(BaseAgent[FlashSACConfig]):
                 cur_n=self._cur_noise_repeat_n,
                 zeta_cdf=self._zeta_cdf,
             )
+            if self._cfg.use_compile:
+                # Compiled CUDA graph outputs are reused by later sampling or
+                # learner calls. Keep exploration state and returned actions
+                # in independently owned storage across those invocations.
+                self._cached_noise = self._cached_noise.clone()
+                self._cur_noise_repeat_count = self._cur_noise_repeat_count.clone()
+                self._cur_noise_repeat_n = self._cur_noise_repeat_n.clone()
+                actions = actions.clone()
 
         return actions
 
