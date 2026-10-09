@@ -6,9 +6,10 @@ and Adam optimizer. The complete learning update is CUDA capturable: GAE,
 advantage normalization, policy/value forward passes, clipped objective,
 backward passes, gradient clipping, Adam, and gradient reset.
 
-The initial scope is deliberately small: fixed observation/action dimensions,
-diagonal Gaussian policies, independent actor and critic MLPs, one NVIDIA GPU,
-and full-batch epochs. It has no minibatch shuffle, distributed training,
+The scope is fixed observation/action dimensions, diagonal Gaussian policies,
+independent actor and critic MLPs, and one NVIDIA GPU. Full-batch epochs remain
+the default. Optional shuffled minibatches and a Gaussian-KL adaptive learning
+rate also run entirely on the device. There is no distributed training,
 visual encoder, recurrent policy, or KL-driven early stopping.
 
 ## Install and run
@@ -53,6 +54,81 @@ loading; configuration and rollout/environment state are not in the checkpoint.
 The arrays are restored in place so an existing update graph remains valid.
 Warp-NN 0.4 does not expose Adam checkpoint methods; this module accesses its
 moment arrays explicitly and therefore constrains that dependency's version.
+
+## Match Isaac Lab's stock G1 PPO configuration
+
+The following options reproduce the numerical conventions used by RSL-RL 5.5.1
+and Isaac Lab's flat G1 configuration. These are opt-in; existing configuration
+defaults and NPZ checkpoint keys remain unchanged.
+
+```python
+config = PPOConfig(
+    hidden_dims=(256, 128, 128),
+    activation="elu",
+    std_type="scalar",
+    initial_std=1.0,
+    std_range=(1e-6, 1e6),
+    epochs=5,
+    num_mini_batches=4,
+    learning_rate=1e-3,
+    schedule="adaptive",
+    desired_kl=0.01,
+    gamma=0.99,
+    gae_lambda=0.95,
+    clip_ratio=0.2,
+    value_coefficient=1.0,
+    value_loss_scale=1.0,
+    entropy_coefficient=0.008,
+    max_grad_norm=1.0,
+    advantage_sample_std=True,
+    timeout_bootstrap="current",
+    separate_grad_clipping=True,
+    optimized_linear_backward=True,
+)
+```
+
+Important numerical conventions:
+
+- Scalar standard deviation is a directly optimized parameter; the distribution
+  uses its value clamped to `std_range`, including the clamp's gradient. The
+  parameter itself is not projected after Adam. The default log parameterization
+  retains its previous unconstrained behavior.
+- `value_loss_scale=1.0` uses the full mean squared error. The default `0.5`
+  retains the original RoboLearn objective. `value_coefficient` is a separate
+  multiplier in the combined policy, value, and entropy objective.
+- Sample standard deviation uses Bessel's correction and adds epsilon after
+  the square root, matching Torch's default `std()` normalization.
+- `timeout_bootstrap="current"` uses `V(s_t)` for a timeout, matching RSL-RL's
+  reward bootstrap convention. The default `"next"` uses the pre-reset
+  `V(s_{t+1})`. Both stop GAE traces across resets.
+- Separate gradient clipping gives the actor plus distribution parameters and
+  the critic their own norm limits. Default clipping uses one combined norm.
+- One fresh device permutation is reused across all epochs of an update.
+  The batch size must divide evenly into `num_mini_batches`. Random 64-bit keys
+  are sorted with Warp's radix sort; its temporary storage is warmed before
+  capture.
+- Before each minibatch update, Gaussian `KL(old || new)` above twice
+  `desired_kl` divides the learning rate by 1.5 (minimum `1e-5`). A positive KL
+  below half `desired_kl` multiplies it by 1.5 (maximum `1e-2`). There are no
+  host scalar reads in the update.
+
+`agent.health_metrics()` synchronizes distribution and optimizer diagnostics
+when called. Use it at a logging cadence; it is not part of graph capture.
+Losses, KL, and gradient norms describe the most recent minibatch, rather than
+epoch averages. Checkpoint loading requires the same parameterization and
+configuration as saving.
+
+A standalone fixed-rollout numerical diagnostic compares GAE, a complete
+20-minibatch update, Adam state, and eager/captured replay with Torch formulas
+following the installed RSL-RL 5.5.1 implementation:
+
+```bash
+uv run python examples/diagnose_ppo_update.py --output ppo-update-diagnostic.json
+uv run python examples/diagnose_ppo_update.py --linear-backward stock --output ppo-stock-update-diagnostic.json
+```
+
+It also requires Torch. This synthetic diagnostic does not establish locomotion
+learning quality or comparative training speed.
 
 ## Capture physics and learning together
 
