@@ -502,6 +502,14 @@ class FlashSAC(BaseAgent[FlashSACConfig]):
                 cur_n=self._cur_noise_repeat_n,
                 zeta_cdf=self._zeta_cdf,
             )
+            if self._cfg.use_compile:
+                # Compiled CUDA graph outputs are reused by later sampling or
+                # learner calls. Keep exploration state and returned actions
+                # in independently owned storage across those invocations.
+                self._cached_noise = self._cached_noise.clone()
+                self._cur_noise_repeat_count = self._cur_noise_repeat_count.clone()
+                self._cur_noise_repeat_n = self._cur_noise_repeat_n.clone()
+                actions = actions.clone()
 
         return actions
 
@@ -521,7 +529,13 @@ class FlashSAC(BaseAgent[FlashSACConfig]):
     def can_start_training(self) -> bool:
         return self._replay_buffer.can_sample()
 
-    def update(self) -> dict[str, Any]:
+    def update(self, *, tensor_metrics: bool = False) -> dict[str, Any]:
+        """Run one replay update and return diagnostics.
+
+        ``tensor_metrics=True`` returns detached device tensors so callers can
+        aggregate diagnostics before a single host read at a logging boundary.
+        The default retains the existing Python-float result.
+        """
         batch = cast(dict[str, torch.Tensor], self._replay_buffer.sample())
 
         for k, v in batch.items():
@@ -552,6 +566,13 @@ class FlashSAC(BaseAgent[FlashSACConfig]):
             grad_scaler=self._grad_scaler,
         )
         self._update_step += 1
+
+        if tensor_metrics:
+            return {
+                key: value.detach() if isinstance(value, torch.Tensor) else value
+                for key, value in _update_info.items()
+                if not isinstance(value, dict)
+            }
 
         # Convert tensors to floats
         update_info: dict[str, float] = {}

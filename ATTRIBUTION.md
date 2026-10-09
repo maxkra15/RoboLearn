@@ -31,6 +31,9 @@ Adaptations in this extraction:
 - Reset episode accumulators when loading reward statistics into a different environment count.
 - Stored effective bootstrap discounts for n-step returns interrupted by timeouts.
 - Added an Isaac Lab 3 adapter with pre-reset terminal observations.
+- Added an optional detached device-tensor metric result for deferred logging;
+  the authors' network updates and default Python-float result are retained.
+- Preserve exploration state and action storage across compiled graph invocations.
 
 RoboLearn's checkpoints support weight and optimizer resume. Replay saving is
 optional, and pending n-step transitions, exploration noise, and RNG state are
@@ -51,6 +54,13 @@ The Warp PPO implementation is original RoboLearn code implementing:
 
 It uses the clipped PPO objective and GAE. Numerical references and capture tests
 are provided; this implementation is not a port of RSL-RL source code.
+
+The optional Isaac Lab G1 PPO configuration follows numerical conventions in
+[RSL-RL 5.5.1](https://github.com/leggedrobotics/rsl_rl): scalar Gaussian
+standard deviation, full value MSE, sample-standard-deviation advantage
+normalization, current-value timeout bootstrapping, separate actor/critic
+gradient clipping, and Gaussian-KL learning-rate adaptation. These options
+were independently implemented in Warp; RSL-RL remains the reference learner.
 
 ## Dependencies and project structure
 

@@ -10,11 +10,13 @@ class IsaacLabEnv:
     """Expose flat actor/critic observations and pre-reset transitions.
 
     The environment must enable ``cfg.compute_final_obs`` before construction.
-    Actions are normalized to [-1, 1] and scaled exactly once at the boundary.
+    Actions are clipped and scaled exactly once at the boundary. The default
+    normalized range is [-1, 1]; ``clip_actions=None`` preserves native policy
+    actions for callers matching an unclipped environment contract.
     This adapter does not import Isaac Lab or launch a simulator.
     """
 
-    def __init__(self, env, observation_group="policy", critic_group=None, action_scale=1.0):
+    def __init__(self, env, observation_group="policy", critic_group=None, action_scale=1.0, clip_actions=1.0):
         self.env = env.unwrapped
         if not self.env.cfg.compute_final_obs:
             raise ValueError("Enable env_cfg.compute_final_obs before creating the environment.")
@@ -23,6 +25,9 @@ class IsaacLabEnv:
         self.device = self.env.device
         self.num_envs = self.env.num_envs
         self.action_scale = torch.as_tensor(action_scale, device=self.device, dtype=torch.float32)
+        if clip_actions is not None and clip_actions <= 0:
+            raise ValueError("clip_actions must be positive or None.")
+        self.clip_actions = clip_actions
         space = self.env.single_observation_space
         for group in (observation_group, critic_group):
             if group and (space[group].shape is None or len(space[group].shape) != 1):
@@ -47,7 +52,9 @@ class IsaacLabEnv:
         episodes. The returned observation is the state for the next policy call.
         """
         before = self._observations(self.env.obs_buf).clone()
-        actions = actions.to(self.device).clamp(-1.0, 1.0)
+        actions = actions.to(self.device, copy=self.clip_actions is None)
+        if self.clip_actions is not None:
+            actions = actions.clamp(-self.clip_actions, self.clip_actions)
         groups, reward, terminated, truncated, extras = self.env.step(actions * self.action_scale)
         observations = self._observations(groups).clone()
         done = terminated | truncated

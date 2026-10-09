@@ -6,9 +6,10 @@ and Adam optimizer. The complete learning update is CUDA capturable: GAE,
 advantage normalization, policy/value forward passes, clipped objective,
 backward passes, gradient clipping, Adam, and gradient reset.
 
-The initial scope is deliberately small: fixed observation/action dimensions,
-diagonal Gaussian policies, independent actor and critic MLPs, one NVIDIA GPU,
-and full-batch epochs. It has no minibatch shuffle, distributed training,
+The scope is fixed observation/action dimensions, diagonal Gaussian policies,
+independent actor and critic MLPs, and one NVIDIA GPU. Full-batch epochs remain
+the default. Optional shuffled minibatches and a Gaussian-KL adaptive learning
+rate also run entirely on the device. There is no distributed training,
 visual encoder, recurrent policy, or KL-driven early stopping.
 
 ## Install and run
@@ -54,6 +55,100 @@ The arrays are restored in place so an existing update graph remains valid.
 Warp-NN 0.4 does not expose Adam checkpoint methods; this module accesses its
 moment arrays explicitly and therefore constrains that dependency's version.
 
+## Match Isaac Lab's stock G1 PPO configuration
+
+The following options reproduce the numerical conventions used by RSL-RL 5.5.1
+and Isaac Lab's flat G1 configuration. These are opt-in; existing configuration
+defaults and NPZ checkpoint keys remain unchanged.
+
+```python
+config = PPOConfig(
+    hidden_dims=(256, 128, 128),
+    activation="elu",
+    std_type="scalar",
+    initial_std=1.0,
+    std_range=(1e-6, 1e6),
+    epochs=5,
+    num_mini_batches=4,
+    learning_rate=1e-3,
+    schedule="adaptive",
+    desired_kl=0.01,
+    gamma=0.99,
+    gae_lambda=0.95,
+    clip_ratio=0.2,
+    value_coefficient=1.0,
+    value_loss_scale=1.0,
+    entropy_coefficient=0.008,
+    max_grad_norm=1.0,
+    advantage_sample_std=True,
+    timeout_bootstrap="current",
+    separate_grad_clipping=True,
+    optimized_linear_backward=True,
+)
+
+# Dimensions and collection budget for Isaac-Velocity-Flat-G1 in the recorded run.
+agent = WarpPPO(observation_dim=123, action_dim=37, num_envs=1024, horizon=24, config=config, device="cuda:0")
+```
+
+The recorded G1 learner used RoboLearn source
+[`dc772f9`](https://github.com/maxkra15/RoboLearn/commit/dc772f9d65c21441c9bdb70ed905557074e00f7e),
+Warp 1.17.0, Warp-NN 0.4.0, and FP32 updates. The 0.2.0 package preserves this
+learner code. Keep `optimized_linear_backward=True` explicit when reproducing
+the run: the library default remains the original Warp-NN backward.
+The Isaac Lab MDP uses Torch, and physics and learning have separate graphs;
+these results do not measure the fully captured direct example below.
+See the [Isaac Lab integration](isaaclab.md) for the environment and runner.
+Native Gaussian PPO uses `IsaacLabEnv(..., clip_actions=None)`. The adapter now
+copies unclipped actions into owned transition storage, so reuse of the policy's
+action buffer cannot change an earlier replay transition. This adds one device
+copy per adapter step; it does not change action values or the learner update.
+
+Important numerical conventions:
+
+- Scalar standard deviation is a directly optimized parameter; the distribution
+  uses its value clamped to `std_range`, including the clamp's gradient. The
+  parameter itself is not projected after Adam. The default log parameterization
+  retains its previous unconstrained behavior.
+- `value_loss_scale=1.0` uses the full mean squared error. The default `0.5`
+  retains the original RoboLearn objective. `value_coefficient` is a separate
+  multiplier in the combined policy, value, and entropy objective.
+- Sample standard deviation uses Bessel's correction and adds epsilon after
+  the square root, matching Torch's default `std()` normalization.
+- `timeout_bootstrap="current"` uses `V(s_t)` for a timeout, matching RSL-RL's
+  reward bootstrap convention. The default `"next"` uses the pre-reset
+  `V(s_{t+1})`. Both stop GAE traces across resets.
+- Separate gradient clipping gives the actor plus distribution parameters and
+  the critic their own norm limits. Default clipping uses one combined norm.
+- One fresh device permutation is reused across all epochs of an update.
+  The batch size must divide evenly into `num_mini_batches`. Random 64-bit keys
+  are sorted with Warp's radix sort; its temporary storage is warmed before
+  capture.
+- Before each minibatch update, Gaussian `KL(old || new)` above twice
+  `desired_kl` divides the learning rate by 1.5 (minimum `1e-5`). A positive KL
+  below half `desired_kl` multiplies it by 1.5 (maximum `1e-2`). There are no
+  host scalar reads in the update.
+
+`agent.health_metrics()` synchronizes distribution and optimizer diagnostics
+when called. Use it at a logging cadence; it is not part of graph capture.
+Losses, KL, and gradient norms describe the most recent minibatch, rather than
+epoch averages. Checkpoint loading requires the same parameterization and
+configuration as saving.
+
+A standalone fixed-rollout numerical diagnostic compares GAE, a complete
+20-minibatch update, Adam state, and eager/captured replay with Torch formulas
+following the installed RSL-RL 5.5.1 implementation:
+
+```bash
+uv run python examples/diagnose_ppo_update.py --output ppo-update-diagnostic.json
+uv run python examples/diagnose_ppo_update.py --linear-backward stock --output ppo-stock-update-diagnostic.json
+```
+
+It also requires Torch. Both backward paths passed this fixed-rollout reference
+before the G1 runs: eager/captured learner state matched exactly, with maximum
+absolute errors of approximately `5.1e-7` for parameters and `1.0e-6` for Adam
+moments against Torch. This synthetic diagnostic does not establish locomotion
+learning quality or comparative training speed.
+
 ## Capture physics and learning together
 
 The direct MuJoCo Warp example includes policy sampling, actions, physics,
@@ -76,6 +171,24 @@ reuse their addresses and shapes, advance random seeds on the device, and use
 device kernels for rewards and resets. Call `wp.capture_launch` to replay.
 `agent.warmup()` prepares the learning part without changing optimizer state;
 environment/inference kernels still need their own warmup.
+
+## Optional tiled network gradients
+
+Set `PPOConfig(optimized_linear_backward=True)` to replace Warp-NN's generated
+Linear backward with separate tiled input-gradient and weight-gradient products.
+Weight gradients use fixed split-batch partial buffers and reductions. Forward
+layers, activations, PPO losses, Adam, and checkpoint keys stay compatible.
+The default retains Warp-NN's generated backward for comparisons.
+The G1 recipe above selects the tiled path that was validated in the recorded
+learning runs. The default remains unchanged because one workload does not
+establish a best choice for every network and batch size.
+
+This path uses Warp-NN 0.4 layer caches and Warp's tape callbacks. Its persistent
+scratch buffers are prepared before capture. Numerical diagnostics compare
+FP32 reference gradients, complete PPO updates, and eager versus captured replay;
+floating-point reduction order can change results slightly. Measure the complete
+training workload before selecting it: graph capture and custom kernels do not
+guarantee faster matrix multiplication than optimized Torch backends.
 
 Capturing the whole Isaac Lab `env.step()` requires its observation, reward,
 event, reset, and bookkeeping paths to support capture. This library demonstrates

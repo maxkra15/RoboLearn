@@ -59,10 +59,10 @@ class ReusingVectorEnv:
         self.truncated.fill_(False)
 
 
-@pytest.mark.parametrize("critic_group", [None, "critic"])
-def test_adapter_preserves_transitions_and_scales_actions_once(critic_group):
+@pytest.mark.parametrize(("critic_group", "clip_actions"), [(None, 1.0), ("critic", None)])
+def test_adapter_preserves_transitions_and_scales_actions_once(critic_group, clip_actions):
     env = ReusingVectorEnv()
-    adapter = IsaacLabEnv(env, critic_group=critic_group, action_scale=3.0)
+    adapter = IsaacLabEnv(env, critic_group=critic_group, action_scale=3.0, clip_actions=clip_actions)
     initial = adapter.reset()
     actions = torch.tensor([[2.0, -2.0], [0.25, -0.5], [0.0, 1.0]])
     observations, transition = adapter.step(actions)
@@ -81,8 +81,14 @@ def test_adapter_preserves_transitions_and_scales_actions_once(critic_group):
     torch.testing.assert_close(transition["observation"], expected_before)
     torch.testing.assert_close(observations, expected_after_reset)
     torch.testing.assert_close(transition["next_observation"], expected_replay_next)
-    torch.testing.assert_close(transition["action"], torch.tensor([[1.0, -1.0], [0.25, -0.5], [0.0, 1.0]]))
-    torch.testing.assert_close(env.received_actions, torch.tensor([[3.0, -3.0], [0.75, -1.5], [0.0, 3.0]]))
+    if clip_actions is None:
+        expected_actions = torch.tensor([[2.0, -2.0], [0.25, -0.5], [0.0, 1.0]])
+        expected_controls = torch.tensor([[6.0, -6.0], [0.75, -1.5], [0.0, 3.0]])
+    else:
+        expected_actions = torch.tensor([[1.0, -1.0], [0.25, -0.5], [0.0, 1.0]])
+        expected_controls = torch.tensor([[3.0, -3.0], [0.75, -1.5], [0.0, 3.0]])
+    torch.testing.assert_close(transition["action"], expected_actions)
+    torch.testing.assert_close(env.received_actions, expected_controls)
     torch.testing.assert_close(transition["reward"], torch.tensor([1.0, 2.0, 3.0]))
     torch.testing.assert_close(transition["terminated"], torch.tensor([True, False, False]))
     torch.testing.assert_close(transition["truncated"], torch.tensor([False, True, False]))
