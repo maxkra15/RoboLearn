@@ -1,4 +1,27 @@
-# FlashSAC with Isaac Lab 3
+# Isaac Lab 3 integration
+
+The [Isaac Lab integration branch](https://github.com/maxkra15/IsaacLab/tree/experiment/g1-learning-baselines)
+registers RoboLearn as an RL backend. After configuring that checkout and
+installing RoboLearn into its environment, select a learner through the native CLI:
+
+```bash
+uv run --no-sync isaaclab train --rl_library robolearn --algorithm warp_ppo \
+    --task Isaac-Velocity-Flat-G1 --num_envs 1024 --max_iterations 2050 \
+    --seed 0 physics=newton_mjwarp \
+    agent.algorithm_cfg.optimized_linear_backward=true
+
+uv run --no-sync isaaclab train --rl_library robolearn --algorithm flashsac \
+    --task Isaac-Velocity-Flat-G1 --num_envs 1024 --max_iterations 2050 \
+    --seed 0 physics=newton_mjwarp
+```
+
+The integration owns simulator launch, task configuration, rollout collection,
+and checkpoints. RoboLearn owns the learner and tensor adapter. Installing the
+library into an upstream checkout does not add these registrations.
+See the [G1 guide](g1.md) for pinned installation, the exact matched recipes,
+common evaluations, timing scopes, and three-seed results.
+
+## Standalone FlashSAC example
 
 Install and validate Isaac Lab 3 first. From its checkout, install RoboLearn
 into the existing environment; Isaac Lab owns its NumPy, PyTorch, and Gymnasium versions:

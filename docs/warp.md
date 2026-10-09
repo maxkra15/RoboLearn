@@ -85,7 +85,23 @@ config = PPOConfig(
     separate_grad_clipping=True,
     optimized_linear_backward=True,
 )
+
+# Dimensions and collection budget for Isaac-Velocity-Flat-G1 in the recorded run.
+agent = WarpPPO(observation_dim=123, action_dim=37, num_envs=1024, horizon=24, config=config, device="cuda:0")
 ```
+
+The recorded G1 learner used RoboLearn source
+[`dc772f9`](https://github.com/maxkra15/RoboLearn/commit/dc772f9d65c21441c9bdb70ed905557074e00f7e),
+Warp 1.17.0, Warp-NN 0.4.0, and FP32 updates. The 0.2.0 package preserves this
+learner code. Keep `optimized_linear_backward=True` explicit when reproducing
+the run: the library default remains the original Warp-NN backward.
+The Isaac Lab MDP uses Torch, and physics and learning have separate graphs;
+these results do not measure the fully captured direct example below.
+See the [Isaac Lab integration](isaaclab.md) for the environment and runner.
+Native Gaussian PPO uses `IsaacLabEnv(..., clip_actions=None)`. The adapter now
+copies unclipped actions into owned transition storage, so reuse of the policy's
+action buffer cannot change an earlier replay transition. This adds one device
+copy per adapter step; it does not change action values or the learner update.
 
 Important numerical conventions:
 
@@ -127,7 +143,10 @@ uv run python examples/diagnose_ppo_update.py --output ppo-update-diagnostic.jso
 uv run python examples/diagnose_ppo_update.py --linear-backward stock --output ppo-stock-update-diagnostic.json
 ```
 
-It also requires Torch. This synthetic diagnostic does not establish locomotion
+It also requires Torch. Both backward paths passed this fixed-rollout reference
+before the G1 runs: eager/captured learner state matched exactly, with maximum
+absolute errors of approximately `5.1e-7` for parameters and `1.0e-6` for Adam
+moments against Torch. This synthetic diagnostic does not establish locomotion
 learning quality or comparative training speed.
 
 ## Capture physics and learning together
@@ -160,6 +179,9 @@ Linear backward with separate tiled input-gradient and weight-gradient products.
 Weight gradients use fixed split-batch partial buffers and reductions. Forward
 layers, activations, PPO losses, Adam, and checkpoint keys stay compatible.
 The default retains Warp-NN's generated backward for comparisons.
+The G1 recipe above selects the tiled path that was validated in the recorded
+learning runs. The default remains unchanged because one workload does not
+establish a best choice for every network and batch size.
 
 This path uses Warp-NN 0.4 layer caches and Warp's tape callbacks. Its persistent
 scratch buffers are prepared before capture. Numerical diagnostics compare

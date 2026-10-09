@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 - 2026-10-09
 
 - Added opt-in RSL-style Warp PPO settings: ELU networks, directly learned
   Gaussian standard deviation, shuffled minibatches, device-side adaptive KL
@@ -9,12 +9,17 @@
   Torch/Warp numerical diagnostic.
 - Added optional unclipped Isaac Lab action passthrough for native Gaussian PPO
   policies, preserving FlashSAC's default normalized action bounds.
+- Fixed replay action ownership for the unclipped Isaac Lab adapter: later
+  caller mutations no longer alter a returned transition.
 - Added an opt-in detached device-tensor metric result to the adapted FlashSAC
   update API, allowing callers to defer host scalar reads until logging.
 - Preserve compiled FlashSAC exploration state and returned actions across
   subsequent CUDA graph invocations using independently owned tensor storage.
 - Added opt-in tiled Linear gradients for Warp PPO, using split-batch parameter
   reductions while preserving Warp-NN forward layers and checkpoint format.
+- Documented the Warp PPO settings and dependency versions used in the G1 runs.
+- Added one CPU regression for compiled sampling output ownership; extended the
+  existing learner and adapter checks for device metrics and unclipped actions.
 
 ## 0.1.0
 

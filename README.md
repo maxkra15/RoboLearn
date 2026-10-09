@@ -20,7 +20,7 @@ pip install 'robolearn-rl[warp] @ git+https://github.com/maxkra15/RoboLearn.git'
 ```
 
 The distribution is named `robolearn-rl`; the Python import is `robolearn`.
-Releases are hosted on GitHub.
+Source releases are hosted on GitHub; nothing is published to PyPI.
 
 For development:
 
@@ -29,7 +29,7 @@ git clone https://github.com/maxkra15/RoboLearn.git
 cd RoboLearn
 uv sync --extra flashsac --extra warp
 uv run ruff check .
-uv run pytest
+uv run pytest -q tests/test_flashsac.py tests/test_isaaclab_adapter.py
 ```
 
 Isaac Lab and MuJoCo Warp are installed separately in their own supported
@@ -53,13 +53,31 @@ See [the Warp guide](docs/warp.md) and [capture example](examples/warp_ppo_graph
 Graph capture requires fixed shapes and persistent device buffers. Capturing an
 entire simulation and training cycle also requires device implementations of
 observations, rewards, resets, and rollout collection.
-The initial PPO implementation supports state observations on one GPU. A
+The PPO implementation supports state observations on one GPU. A
 [MuJoCo Warp example](examples/mujoco_warp_capture.py) captures physics, rollout
 collection, and PPO updates in one graph. FlashSAC currently uses PyTorch;
-a WarpNN port and comparative speed benchmarks remain future work.
+a WarpNN port remains future work.
 
-See [initial validation results](docs/validation.md) for the Isaac Lab drawer
-run, checkpoint playback, and CUDA capture checks.
+## Isaac Lab G1 results
+
+The [G1 reproduction guide](docs/g1.md) compares stock RSL-RL PPO, matched Warp
+PPO, and the authors' optimized FlashSAC recipe on the same Isaac Lab 3 task.
+Each learner used three seeds and 50.38 million transitions per seed on isolated
+NVIDIA L40 GPUs. All final forward evaluations passed walking and survival.
+
+- Warp PPO reduced PPO update time by **18.6%**; its production training loop
+  was **2.5% faster** because rollout dominated. Preparation costs prevented
+  an overall command-pipeline speed win.
+- FlashSAC passed the walking gate at earlier sampled checkpoints and achieved
+  lower final tracking error, while taking longer to process the full budget.
+
+These are descriptive results for one task. The MDP runs in Torch, with separate
+physics and learner graphs. The tested Warp recipe explicitly enables tiled
+Linear gradients; FlashSAC uses AMP, compilation, and deferred tensor metrics.
+The library keeps existing defaults, so use the documented recipe to reproduce it.
+
+See [earlier validation](docs/validation.md) for the drawer run, checkpoint
+playback, and direct CUDA capture checks.
 
 ## Credits
 
