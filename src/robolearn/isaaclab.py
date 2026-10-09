@@ -52,7 +52,7 @@ class IsaacLabEnv:
         episodes. The returned observation is the state for the next policy call.
         """
         before = self._observations(self.env.obs_buf).clone()
-        actions = actions.to(self.device)
+        actions = actions.to(self.device, copy=self.clip_actions is None)
         if self.clip_actions is not None:
             actions = actions.clamp(-self.clip_actions, self.clip_actions)
         groups, reward, terminated, truncated, extras = self.env.step(actions * self.action_scale)

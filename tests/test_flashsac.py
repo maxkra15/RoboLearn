@@ -42,6 +42,17 @@ def _config(**overrides):
     return replace(cfg, **overrides)
 
 
+@pytest.fixture
+def eager_compilation(monkeypatch):
+    """Use Torch's real compiler wrapper without CPU code generation."""
+    compiler = torch.compile
+
+    def eager_backend(function, *, mode=None, **kwargs):
+        return compiler(function, backend="eager", **kwargs)
+
+    monkeypatch.setattr(torch, "compile", eager_backend)
+
+
 def _collect(agent, observations, steps=4):
     for _ in range(steps):
         actions = agent.act(observations)
@@ -75,10 +86,20 @@ def test_replay_updates_change_policy_with_finite_losses():
 
     _collect(agent, observations)
     assert agent.ready
-    for _ in range(3):
-        losses = agent.update()
+    for step in range(3):
+        tensor_metrics = step == 0
+        losses = agent.update(tensor_metrics=tensor_metrics)
         assert losses
-        assert all(np.isfinite(value) for value in losses.values())
+        if tensor_metrics:
+            assert all(
+                isinstance(value, torch.Tensor)
+                and value.device == observations.device
+                and not value.requires_grad
+                and torch.isfinite(value).all()
+                for value in losses.values()
+            )
+        else:
+            assert all(isinstance(value, float) and np.isfinite(value) for value in losses.values())
 
     after = agent.act(observations, training=False)
     assert torch.isfinite(after).all()
@@ -113,7 +134,7 @@ def test_checkpoint_restores_policy_with_different_environment_count(tmp_path, n
     assert all(np.isfinite(value) for value in losses.values())
 
 
-def test_checkpoints_transfer_between_eager_and_compiled_agents(tmp_path, monkeypatch):
+def test_checkpoints_transfer_between_eager_and_compiled_agents(tmp_path, eager_compilation):
     torch.manual_seed(30)
     cfg = _config(normalize_reward=False)
     trained = FlashSAC(3, 2, num_envs=2, cfg=cfg)
@@ -125,13 +146,6 @@ def test_checkpoints_transfer_between_eager_and_compiled_agents(tmp_path, monkey
     compiled_checkpoint = str(tmp_path / "compiled")
     trained.save(eager_checkpoint)
 
-    # Use the real compiler wrapper with its eager backend to avoid CPU code generation.
-    compiler = torch.compile
-
-    def eager_backend(function, *, mode=None, **kwargs):
-        return compiler(function, backend="eager", **kwargs)
-
-    monkeypatch.setattr(torch, "compile", eager_backend)
     compiled = FlashSAC(3, 2, num_envs=2, cfg=replace(cfg, use_compile=True, compile_mode="default"))
     compiled.load(eager_checkpoint)
     compiled.save(compiled_checkpoint)
@@ -139,6 +153,45 @@ def test_checkpoints_transfer_between_eager_and_compiled_agents(tmp_path, monkey
     restored = FlashSAC(3, 2, num_envs=2, cfg=cfg)
     restored.load(compiled_checkpoint)
     torch.testing.assert_close(restored.act(observations, training=False), expected, rtol=1e-6, atol=1e-7)
+
+
+def test_compiled_sampling_owns_reusable_output_storage(eager_compilation):
+    """CPU storage contract: retained actions and noise survive producer reuse.
+
+    Reuse real sampler results in persistent buffers to model the compiled
+    producer's storage contract. This does not exercise CUDA graph execution.
+    """
+    cfg = _config(normalize_reward=False, actor_noise_zeta_mu=0.0)
+    reference = FlashSAC(3, 2, num_envs=2, cfg=cfg)
+    compiled = FlashSAC(3, 2, num_envs=2, cfg=replace(cfg, use_compile=True, compile_mode="default"))
+    sampler, buffers = compiled._sample_actions, []
+
+    def reuse_outputs(**kwargs):
+        values = sampler(**kwargs)
+        if not buffers:
+            buffers.extend(value.clone() for value in values)
+        else:
+            for buffer, value in zip(buffers, values, strict=True):
+                buffer.copy_(value)
+        return tuple(buffers)
+
+    compiled._sample_actions = reuse_outputs
+    observations = torch.tensor([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])
+    held_actions, held_expected = None, None
+    for step, inputs in enumerate((observations, observations, observations + 1.0)):
+        torch.manual_seed(step)
+        expected = reference.act(inputs)
+        if step == 1:
+            # A later compiled operation may overwrite the producer's buffers.
+            for buffer in buffers:
+                buffer.zero_()
+            torch.testing.assert_close(expected, held_expected)
+        torch.manual_seed(step)
+        actual = compiled.act(inputs)
+        torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+        if step == 0:
+            held_actions, held_expected = actual, expected.clone()
+        torch.testing.assert_close(held_actions, held_expected, rtol=1e-6, atol=1e-7)
 
 
 def test_n_step_replay_stops_at_done_and_preserves_timeout_bootstrap():
