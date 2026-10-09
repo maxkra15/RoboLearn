@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0 - 2026-10-09
+
+- Added an experimental FP32 Warp-NN FlashSAC backend with the authors' residual
+  networks, categorical critics, update order, persistent replay and captured
+  learning updates. Mixed precision and G1 speed/quality improvements are not
+  established.
+- Separated the shared FlashSAC configuration from optional Torch imports.
+- Added fixed-order BatchNorm, RMSNorm, and LogSoftmax backward reductions to the experimental
+  Warp FlashSAC backend, retaining Warp-NN forward statistics and parameters.
+- Documented the fixed-budget Cartpole comparison protocol and experimental
+  learning/runtime limitations from an audited four-recipe, three-seed cohort.
+
+The initial Cartpole comparison measures a frozen 0.2.0 working snapshot of this
+backend. This release metadata bump does not change its learner implementation.
+
 ## 0.2.0 - 2026-10-09
 
 - Added opt-in RSL-style Warp PPO settings: ELU networks, directly learned

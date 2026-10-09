@@ -3,7 +3,7 @@
 Small reinforcement learning implementations for GPU robot simulation.
 
 - **FlashSAC:** a PyTorch library adapted from the authors' official implementation,
-  with an Isaac Lab 3 example.
+  with an Isaac Lab 3 example and an experimental FP32 Warp-NN backend.
 - **PPO:** an implementation using [NVIDIA WarpNN](https://nvidia.github.io/warp-nn/),
   with fixed buffers and a CUDA graph capture interface.
 
@@ -47,6 +47,12 @@ The agent exposes tensor actions, transition ingestion, gradient updates, and
 checkpointing. See [the Isaac Lab guide](docs/isaaclab.md) and
 [example](examples/isaaclab_flashsac.py) for a complete training and evaluation loop.
 
+The experimental `robolearn.warp.WarpFlashSAC` backend uses the same configuration,
+authors' residual networks, categorical critics, and update order. It accepts Warp
+arrays and captures replay sampling and learning updates. Start with FP32 to check
+numerical fidelity; mixed precision is not implemented. See the
+[Warp FlashSAC guide](docs/warp_flashsac.md) for scope and validation status.
+
 ## WarpNN PPO
 
 See [the Warp guide](docs/warp.md) and [capture example](examples/warp_ppo_graph.py).
@@ -55,8 +61,8 @@ entire simulation and training cycle also requires device implementations of
 observations, rewards, resets, and rollout collection.
 The PPO implementation supports state observations on one GPU. A
 [MuJoCo Warp example](examples/mujoco_warp_capture.py) captures physics, rollout
-collection, and PPO updates in one graph. FlashSAC currently uses PyTorch;
-a WarpNN port remains future work.
+collection, and PPO updates in one graph. The experimental Warp-NN FlashSAC
+backend captures learning separately from the Isaac Lab environment.
 
 ## Isaac Lab G1 results
 

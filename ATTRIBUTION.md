@@ -5,7 +5,9 @@ names refer to the work of their original authors, not an invention of this proj
 
 ## FlashSAC
 
-The PyTorch implementation in `src/robolearn/flashsac/` is derived from
+The PyTorch implementation in `src/robolearn/flashsac/` and experimental FP32
+Warp-NN implementation in `src/robolearn/warp/flashsac.py` and `_flash_*.py`
+are derived from
 [Holiday-Robot/FlashSAC](https://github.com/Holiday-Robot/FlashSAC), commit
 `87edc9061150ae9e962dd84e6544e27a1554b3ab`.
 
@@ -34,8 +36,13 @@ Adaptations in this extraction:
 - Added an optional detached device-tensor metric result for deferred logging;
   the authors' network updates and default Python-float result are retained.
 - Preserve exploration state and action storage across compiled graph invocations.
+- Added an experimental Warp-NN implementation of the same residual architecture,
+  categorical losses, entropy adaptation, reward normalization, exploration,
+  update order, and n-step timeout semantics. Device buffers and CUDA capture
+  replace the Torch execution path. This backend uses FP32; it does not reproduce
+  Torch's AMP or random-number stream.
 
-RoboLearn's checkpoints support weight and optimizer resume. Replay saving is
+The Torch backend's checkpoints support weight and optimizer resume. Replay saving is
 optional, and pending n-step transitions, exploration noise, and RNG state are
 not preserved for bitwise identical continuation.
 
