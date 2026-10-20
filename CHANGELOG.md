@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Load Warp learners lazily so selecting PPO does not import experimental FlashSAC.
+- Allow `PPOConfig` imports without installing Torch, Warp, or Warp-NN; preserve
+  existing public imports and configuration defaults.
+- Emit an explicit experimental-backend warning when constructing Warp FlashSAC.
+- Document Isaac Lab logging/checkpoint support, measured FlashSAC bottlenecks,
+  and the separate requirements for learning through simulator gradients.
+
 ## 0.3.0 - 2026-10-09
 
 - Added an experimental FP32 Warp-NN FlashSAC backend with the authors' residual

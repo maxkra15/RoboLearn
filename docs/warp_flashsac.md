@@ -4,6 +4,57 @@
 to Warp-NN 0.4 and FP32 Warp kernels. Original authors, paper, upstream revision,
 and license are recorded in [ATTRIBUTION.md](../ATTRIBUTION.md). This is an
 experimental backend, with no established G1 quality or speed advantage.
+Construction emits a `RuntimeWarning`; selecting Warp PPO does not import this
+backend or its kernels. The recommended FlashSAC path remains the authors' Torch
+implementation in `robolearn.flashsac`.
+
+## Current performance (2026-10-20)
+
+The [current-stack report](https://maxkra15.github.io/reports/2026-10-20-g1-main-baselines/)
+includes isolated synthetic learner measurements with G1 dimensions on an L40,
+Torch 2.11.0, Warp 1.17.0, and Warp-NN 0.4.1:
+
+| Recipe | Mean warmed update time |
+| --- | ---: |
+| Torch FP32 eager | 11.53 ms |
+| Warp FP32 eager | 30.31 ms |
+| Warp FP32 captured | 29.87 ms |
+| Torch FP16 AMP compiled | 4.35 ms |
+
+The two probes share shapes, batch size, update schedule, and initial weights.
+RNG and optimizer state differ. Configured FP32 does not establish strict IEEE
+equivalence: effective TF32 settings and executed hardware instructions were not
+recorded. The AMP comparison combines precision and execution-backend changes.
+These are component timings, excluding physics and policy-quality evaluation.
+
+Capture reduces Warp update time by about 1.5% here. It removes host launch work
+but does not replace the kernels' matrix products or reductions. Current source
+also shows several concrete differences from the Torch path:
+
+- The custom Linear backward uses fixed 16-by-16 tiles, split-batch partial
+  buffers, and separate reductions. It does not use Torch/cuBLAS GEMM dispatch.
+  Warp's `tile_matmul` may itself use NVIDIA MathDx block math; the distinction
+  is the complete matrix-product implementation and scheduling.
+- The two critics execute separately; the Torch implementation stacks its
+  ensemble operations.
+- Fixed-order normalization and LogSoftmax backward reductions favor predictable
+  accumulation. They are not fused with neighboring layers.
+- The port is FP32 only, while the fastest Torch recipe uses compiled FP16 AMP.
+
+The older profiler below identifies dense math as the first optimization target.
+It is not a fresh kernel breakdown of Warp-NN 0.4.1, so the current timing gap
+cannot be assigned percentages without another profile. Warp-NN's own
+[documentation](https://nvidia.github.io/warp-nn/latest/) explains that its kernels
+may be slower than highly optimized cuBLAS/cuDNN implementations.
+
+A useful next experiment is one capture-safe dense backend, measured on the
+actual forward, input-gradient, and weight-gradient shapes. It can use tuned
+Warp tiles or zero-copy vendor GEMM interoperability while retaining Warp buffers
+and graph capture. A smaller cleanup is skipping unused bias-gradient scratch
+and reductions: FlashSAC's Linear layers are bias-free. Neither change is part of
+this status/import cleanup. Validate numerical health and Cartpole learning
+before extending it to G1; no kernel change guarantees perfect GPU utilization,
+faster complete training, or better policies.
 
 ## Why FP32 first
 

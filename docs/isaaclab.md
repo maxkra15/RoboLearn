@@ -55,6 +55,49 @@ smoke/train/evaluation pipeline separately. Cold compilation and module loading
 can dominate short runs, while production processes can reuse smoke caches.
 The [2026-10-09 comparison](g1.md) retains its older frozen setup and results.
 
+## Library API and run ownership
+
+Current configuration imports do not load the optional learning runtimes:
+
+```python
+from robolearn.flashsac import FlashSACConfig
+from robolearn.warp.config import PPOConfig
+```
+
+`PPOConfig` is also exported from `robolearn.warp`; its learner classes load lazily.
+The frozen baseline above intentionally retains its recorded older library pin.
+The lock above records the tested Isaac Lab combination; install runtime extras
+within that supported Python/Torch/Warp environment.
+
+| Learner | Metrics supplied to the caller | Core checkpoint support |
+| --- | --- | --- |
+| Torch FlashSAC | `update(tensor_metrics=True)` returns detached device metrics. | `save`/`load` restore networks, optimizers, schedulers, AMP scaler, and reward statistics. Replay has separate save/load methods. |
+| Warp PPO | `metrics` stays on the device; `health_metrics()` returns a synchronized host snapshot. | `save`/`load` store parameters, Adam state, and sampling seed in NPZ. The caller supplies the matching configuration. |
+| Experimental Warp FlashSAC | `update(tensor_metrics=True)` returns device metrics; `get_metrics()` returns host values. | JSON/NPZ stores configuration, networks, Adam, RNG, and reward statistics; replay is optional. |
+
+RoboLearn core does not create log writers. The Isaac Lab runner provides basic
+logging: console progress and one `metrics.jsonl` record per iteration under
+`logs/robolearn/<experiment>/<run>/`. TensorBoard and W&B writers are not wired
+into this runner. Host metric reads and checkpoint serialization synchronize;
+perform them at logging/checkpoint boundaries outside captured updates.
+
+The integration adds run manifests, saved configurations, and checkpoint JSON
+sidecars with dimensions and iteration/transition/update counters. Native
+`train --checkpoint` restores this state and starts a fresh environment rollout;
+SAC replay is rebuilt by default. `play --checkpoint` restores the saved policy
+contract. The `latest` and `best` selectors currently choose the newest compatible
+checkpoint; `best` does not rank evaluation scores.
+
+### Remaining upstream integration
+
+- Review and maintain the thin Isaac Lab adapter, task/agent registrations, and
+  optional dependency pin in upstream Isaac Lab; installing RoboLearn alone does
+  not register the backend.
+- Add an optional TensorBoard/W&B bridge at the Isaac runner's logging boundary,
+  reusing the existing metrics instead of adding writers to the learner core.
+- Define supported policy export formats and register an export backend. The
+  current fork supports training and playback, without a RoboLearn `isaaclab export` backend.
+
 ## Standalone FlashSAC example
 
 Install and validate Isaac Lab 3 first. From its checkout, install RoboLearn

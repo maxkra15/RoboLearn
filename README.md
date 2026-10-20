@@ -2,10 +2,15 @@
 
 Small reinforcement learning implementations for GPU robot simulation.
 
-- **FlashSAC:** a PyTorch library adapted from the authors' official implementation,
-  with an Isaac Lab 3 example and an experimental FP32 Warp-NN backend.
-- **PPO:** an implementation using [NVIDIA WarpNN](https://nvidia.github.io/warp-nn/),
-  with fixed buffers and a CUDA graph capture interface.
+| Learner | Use | Status |
+| --- | --- | --- |
+| `robolearn.flashsac.FlashSAC` | Authors' Torch implementation, including compilation and AMP | Recommended FlashSAC backend |
+| `robolearn.warp.WarpPPO` | Fixed buffers and capturable Warp-NN PPO updates | Single-GPU state observations |
+| `robolearn.warp.WarpFlashSAC` | FP32 Warp-NN port | Experimental; slower in current learner benchmarks |
+
+Isaac Lab owns simulation, rollout collection, and experiment logging. RoboLearn
+owns policy inference, learning, and native learner checkpoints. The package
+keeps Torch and Warp optional, and configuration imports do not load either runtime.
 
 RoboLearn is an independent project. FlashSAC was developed by Donghu Kim,
 Youngdo Lee, and their coauthors; see [credits](#credits) and [ATTRIBUTION.md](ATTRIBUTION.md).
@@ -52,6 +57,8 @@ authors' residual networks, categorical critics, and update order. It accepts Wa
 arrays and captures replay sampling and learning updates. Start with FP32 to check
 numerical fidelity; mixed precision is not implemented. See the
 [Warp FlashSAC guide](docs/warp_flashsac.md) for scope and validation status.
+Construction emits a `RuntimeWarning` identifying the experimental backend;
+existing imports and checkpoint formats remain available.
 
 The [Cartpole report](https://maxkra15.github.io/reports/2026-10-09-cartpole-flashsac/)
 compares four Torch and Warp recipes with three seeds each. Its
@@ -69,31 +76,35 @@ The PPO implementation supports state observations on one GPU. A
 collection, and PPO updates in one graph. The experimental Warp-NN FlashSAC
 backend captures learning separately from the Isaac Lab environment.
 
-## Isaac Lab G1 results (2026-10-09)
+## Isaac Lab, logging, and results
 
-The [G1 reproduction guide](docs/g1.md) compares stock RSL-RL PPO, matched Warp
-PPO, and the authors' optimized FlashSAC recipe on the same Isaac Lab 3 task.
-Each learner used three seeds and 50.38 million transitions per seed on isolated
-NVIDIA L40 GPUs. All final forward evaluations passed walking and survival.
+The [integration guide](docs/isaaclab.md) covers installation, the native
+`isaaclab train/play --rl_library robolearn` adapter, supported metrics, and
+checkpoint/resume behavior. That adapter currently lives on our Isaac Lab branch;
+installing RoboLearn alone does not register it in upstream Isaac Lab.
+JSONL and console logging are available there. TensorBoard and W&B writers are
+not wired into that runner.
 
-- Warp PPO reduced PPO update time by **18.6%**; its production training loop
-  was **2.5% faster** because rollout dominated. Preparation costs prevented
-  an overall command-pipeline speed win.
-- FlashSAC passed the walking gate at earlier sampled checkpoints and achieved
-  lower final tracking error, while taking longer to process the full budget.
+The [2026-10-20 G1 report](https://maxkra15.github.io/reports/2026-10-20-g1-main-baselines/)
+compares RSL PPO, Warp PPO, and Torch FlashSAC across three seeds each. Warp PPO
+reduced update time by 26.1% and recorded loop time by 4.5%; its complete
+smoke/train/evaluation pipeline took 7.1% longer. Torch FlashSAC passed the walking
+gate at earlier sampled checkpoints while taking longer over the full budget.
+These are descriptive results for one task on isolated L40 allocations.
+The MDP uses Torch and the physics and learner graphs are separate.
 
-These are descriptive results for one task. The MDP runs in Torch, with separate
-physics and learner graphs. The tested Warp recipe explicitly enables tiled
-Linear gradients; FlashSAC uses AMP, compilation, and deferred tensor metrics.
-The library keeps existing defaults, so use the documented recipe to reproduce it.
+The report also includes isolated Warp FlashSAC learner measurements; they do
+not establish G1 learning quality for that backend. See the
+[performance explanation](docs/warp_flashsac.md#current-performance-2026-10-20),
+[historical G1 comparison](docs/g1.md), and [earlier validation](docs/validation.md).
 
-See [earlier validation](docs/validation.md) for the drawer run, checkpoint
-playback, and direct CUDA capture checks.
+## Differentiable learning
 
-For the refreshed main-based stack, see the
-[2026-10-20 G1 baseline report](https://maxkra15.github.io/reports/2026-10-20-g1-main-baselines/) and
-[pinned Isaac Lab integration guide](docs/isaaclab.md#current-main-baseline-2026-10-20).
-The historical results above retain their original source and dependency pins.
+PPO already differentiates its policy and value networks. Using gradients through
+physics requires a differentiable simulator and an additional learning objective.
+The current G1 MuJoCo Warp setup does not provide that path. See
+[differentiable learning](docs/differentiable.md) for the separate experimental
+Cartpole prototype, solver limitations, and a minimal route to a hybrid learner.
 
 ## Credits
 
