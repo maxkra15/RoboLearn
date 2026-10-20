@@ -16,6 +16,7 @@ streams and floating point reduction order differ from the Torch backend.
 
 import json
 import math
+import warnings
 from collections.abc import Mapping
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -312,7 +313,10 @@ def _deterministic_actions(mean: wp.array2d(dtype=wp.float32), actions: wp.array
 
 
 class WarpFlashSAC:
-    """Authors' FlashSAC recipe with persistent FP32 Warp optimization buffers.
+    """Experimental FlashSAC port with persistent FP32 Warp optimization buffers.
+
+    Policy quality and runtime can differ from the authors' Torch backend;
+    evaluate this experimental implementation on the intended task and budget.
 
     ``update`` performs one critic update; call it twice per vector environment
     step for the paper recipe. The first update and every ``actor_update_period``
@@ -353,6 +357,11 @@ class WarpFlashSAC:
             cfg, asymmetric_observation=critic_observation_dim is not None, temp_target_entropy=target_entropy
         )
         self.device = wp.get_device(cfg.device)
+        warnings.warn(
+            "WarpFlashSAC is an experimental FP32 backend; policy quality and speed must be measured for your task.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         self.observation_dim = observation_dim
         self.critic_observation_dim = total_dim
         self.action_dim = action_dim
