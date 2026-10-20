@@ -1,9 +1,20 @@
 # Isaac Lab integration
 
-The [Isaac Lab integration branch](https://github.com/maxkra15/IsaacLab/tree/experiment/robolearn-main-baseline-20261020)
+The [current Isaac Lab integration branch](https://github.com/maxkra15/IsaacLab/tree/feature/robolearn-lean-integration-20261020)
 is based on upstream [main `159af106`](https://github.com/isaac-sim/IsaacLab/commit/159af106ce06165d7147683695b20d2e3ed63257)
-and registers RoboLearn as an RL backend. Use the pinned installation below, then
-select a learner through the native CLI:
+and registers RoboLearn as an RL backend. Its lock pins the cleaned library at
+[`994b6d3d`](https://github.com/maxkra15/RoboLearn/commit/994b6d3ddf3b4d764a5a0a0e74b500cfae3fb3ff),
+including lazy imports and the experimental Warp FlashSAC warning:
+
+```bash
+git clone --branch feature/robolearn-lean-integration-20261020 \
+    https://github.com/maxkra15/IsaacLab.git
+cd IsaacLab
+git checkout d82da26b725039dcacb8cba29d53ebd7b6d45b98
+uv sync --locked --extra robolearn --python 3.12.14
+```
+
+Use uv 0.13.3 for this lock. Then select a learner through the native CLI:
 
 ```bash
 uv run --locked --extra robolearn isaaclab train --rl_library robolearn --algorithm warp_ppo \
@@ -19,8 +30,10 @@ uv run --locked --extra robolearn isaaclab train --rl_library robolearn --algori
 The integration owns simulator launch, task configuration, rollout collection,
 and checkpoints. RoboLearn owns the learner and tensor adapter. Installing the
 library into an upstream checkout does not add these registrations.
-The current main stack is pinned below. The [G1 guide](g1.md) preserves the
-older comparison, its exact recipes, common evaluations, and timing scopes.
+The frozen measured stack is pinned below; the library cleanup does not change
+its algorithm math or defaults and has not been used for a new training run.
+The [G1 guide](g1.md) preserves the older comparison, its exact recipes, common
+evaluations, and timing scopes.
 
 ## Current main baseline (2026-10-20)
 
@@ -146,7 +159,7 @@ Pass a checkpoint without `--evaluate_only` to resume with restored optimizer an
 reward statistics and an empty replay buffer.
 
 This is a standalone external example. RoboLearn's
-[Isaac Lab integration branch](https://github.com/maxkra15/IsaacLab/tree/experiment/robolearn-main-baseline-20261020)
+[Isaac Lab integration branch](https://github.com/maxkra15/IsaacLab/tree/feature/robolearn-lean-integration-20261020)
 also registers it with `isaaclab train --rl_library robolearn`. That integration
 is separate from installing this library into an upstream Isaac Lab checkout.
 
