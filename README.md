@@ -69,7 +69,7 @@ The PPO implementation supports state observations on one GPU. A
 collection, and PPO updates in one graph. The experimental Warp-NN FlashSAC
 backend captures learning separately from the Isaac Lab environment.
 
-## Isaac Lab G1 results
+## Isaac Lab G1 results (2026-10-09)
 
 The [G1 reproduction guide](docs/g1.md) compares stock RSL-RL PPO, matched Warp
 PPO, and the authors' optimized FlashSAC recipe on the same Isaac Lab 3 task.
@@ -89,6 +89,11 @@ The library keeps existing defaults, so use the documented recipe to reproduce i
 
 See [earlier validation](docs/validation.md) for the drawer run, checkpoint
 playback, and direct CUDA capture checks.
+
+For the refreshed main-based stack, see the
+[2026-10-20 G1 baseline report](https://maxkra15.github.io/reports/2026-10-20-g1-main-baselines/) and
+[pinned Isaac Lab integration guide](docs/isaaclab.md#current-main-baseline-2026-10-20).
+The historical results above retain their original source and dependency pins.
 
 ## Credits
 
