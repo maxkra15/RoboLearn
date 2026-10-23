@@ -1,0 +1,80 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 RoboLearn contributors
+# SPDX-License-Identifier: MIT
+"""Fused native CUDA Adam retaining Warp-NN's parameter and optimizer storage."""
+
+import ctypes
+
+import warp as wp
+from warp_nn import optimizers
+from warp_nn.utils import ScopedCapture
+
+from ._runtime import NativePlan, check, library_for, pointer, stream_pointer
+
+
+class CudaAdam(optimizers.Adam):
+    """Use native multi-tensor updates with the existing clipping/state contract.
+
+    Moment ordering, float32 timestep and device learning-rate arrays are owned
+    by Warp-NN. Loading values into them preserves captured pointer addresses.
+    Prepare before capture, and keep the optimizer alive while its graphs run.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not self.device.is_cuda:
+            raise ValueError("CudaAdam requires a CUDA device")
+        self._cuda_plan = None
+
+    def prepare(self):
+        """Copy tensor-pointer metadata to the native plan outside capture."""
+        if self._cuda_plan is not None:
+            return self
+        if self.device.is_capturing:
+            raise RuntimeError("Call CudaAdam.prepare() before capture")
+        groups = (self._parameters, self._gradients, self._m1, self._m2)
+        if not self._parameters:
+            raise ValueError("CudaAdam requires at least one parameter")
+        for group in groups:
+            for array in group:
+                if array.dtype != wp.float32 or array.device != self.device or not array.is_contiguous:
+                    raise ValueError("CudaAdam requires contiguous float32 arrays on its CUDA device")
+        count = len(self._parameters)
+        tables = [(ctypes.c_void_p * count)(*(array.ptr for array in group)) for group in groups]
+        sizes = (ctypes.c_size_t * count)(*(array.size for array in self._parameters))
+        with wp.ScopedDevice(self.device):
+            library = library_for(self.device)
+            handle = library.rl_adam_create(
+                count, *tables, sizes, pointer(self._timestep), pointer(self._lr), *self._betas, self._eps
+            )
+            self._cuda_plan = NativePlan(library, handle, self.device, adam=True)
+        return self
+
+    def step(self, *, lr: float | None = None):
+        """Clip gradients and update all parameters without allocating per step."""
+        self.prepare()
+        if lr is not None:
+            self._lr.fill_(lr)
+
+        def launch():
+            if self._max_norm is not None:
+                self._launch_clip_by_total_norm()
+            plan = self._cuda_plan
+            check(plan.library, plan.library.rl_adam_step(plan.handle, stream_pointer(self.device)), "CUDA Adam")
+
+        with wp.ScopedDevice(self.device):
+            if self._graph_step is None:
+                # An outer capture records native launches directly. Otherwise
+                # preserve Warp-NN's optional optimizer-only graph behavior.
+                enabled = not self._disable_graph and not self.device.is_capturing
+                with ScopedCapture(device=self.device, enabled=enabled) as capture:
+                    launch()
+                self._graph_step = capture.graph
+            if self._graph_step is not None:
+                wp.capture_launch(self._graph_step)
+
+    def close(self):
+        """Release the native plan after captured work and graphs are discarded."""
+        self._graph_step = None
+        if self._cuda_plan is not None:
+            self._cuda_plan.close()
+            self._cuda_plan = None

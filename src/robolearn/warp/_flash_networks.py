@@ -21,6 +21,16 @@ from ._flash_normalization import BatchNorm, LogSoftmax, RMSNorm
 from ._linear import TiledLinear
 
 
+def _linear_type(dense_backend: str, optimized_linear_backward: bool):
+    if dense_backend == "cuda":
+        from robolearn.cuda import CudaLinear
+
+        return CudaLinear
+    if dense_backend != "warp":
+        raise ValueError("dense_backend must be 'warp' or 'cuda'.")
+    return TiledLinear if optimized_linear_backward else nn.Linear
+
+
 @wp.kernel(enable_backward=False)
 def _normalize_rows(weight: wp.array2d(dtype=wp.float32)):
     i = wp.tid()
@@ -136,9 +146,8 @@ def _orthogonal(shape: tuple[int, int], rng: np.random.Generator) -> np.ndarray:
 
 
 class _UnitLinear(nn.Module):
-    def __init__(self, input_dim, output_dim, rng, optimized_linear_backward, requires_grad):
+    def __init__(self, input_dim, output_dim, rng, linear, requires_grad):
         super().__init__(requires_grad=requires_grad)
-        linear = TiledLinear if optimized_linear_backward else nn.Linear
         self.w = linear(input_dim, output_dim, bias=False, initialize_parameters=False, requires_grad=requires_grad)
         wp.copy(self.w.weight.data, wp.array(_orthogonal((output_dim, input_dim), rng), device=self.device))
         super().__post_init__()
@@ -167,10 +176,10 @@ class _UnitRMSNorm(RMSNorm):
 
 
 class _Embedder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, rng, optimized_linear_backward, requires_grad):
+    def __init__(self, input_dim, hidden_dim, rng, linear, requires_grad):
         super().__init__(requires_grad=requires_grad)
         self.norm = _UnitBatchNorm(input_dim, requires_grad)
-        self.w = _UnitLinear(input_dim, hidden_dim, rng, optimized_linear_backward, requires_grad)
+        self.w = _UnitLinear(input_dim, hidden_dim, rng, linear, requires_grad)
         super().__post_init__()
 
     def __call__(self, input: wp.array) -> wp.array:
@@ -178,10 +187,10 @@ class _Embedder(nn.Module):
 
 
 class _ResidualBlock(nn.Module):
-    def __init__(self, hidden_dim, rng, optimized_linear_backward, requires_grad):
+    def __init__(self, hidden_dim, rng, linear, requires_grad):
         super().__init__(requires_grad=requires_grad)
-        self.w1 = _UnitLinear(hidden_dim, hidden_dim * 4, rng, optimized_linear_backward, requires_grad)
-        self.w2 = _UnitLinear(hidden_dim * 4, hidden_dim, rng, optimized_linear_backward, requires_grad)
+        self.w1 = _UnitLinear(hidden_dim, hidden_dim * 4, rng, linear, requires_grad)
+        self.w2 = _UnitLinear(hidden_dim * 4, hidden_dim, rng, linear, requires_grad)
         self.norm1 = _UnitBatchNorm(hidden_dim * 4, requires_grad)
         self.norm2 = _UnitBatchNorm(hidden_dim, requires_grad)
         self.relu1 = nn.ReLU(requires_grad=requires_grad)
@@ -248,15 +257,11 @@ class _FlashNetwork(nn.Module):
 
 
 class _Backbone(_FlashNetwork):
-    def __init__(self, input_dim, hidden_dim, num_blocks, rng, optimized_linear_backward, requires_grad):
+    def __init__(self, input_dim, hidden_dim, num_blocks, rng, linear, requires_grad):
         super().__init__(requires_grad=requires_grad)
-        self.embedder = self.register_module(
-            "embedder", _Embedder(input_dim, hidden_dim, rng, optimized_linear_backward, requires_grad)
-        )
+        self.embedder = self.register_module("embedder", _Embedder(input_dim, hidden_dim, rng, linear, requires_grad))
         self.encoder = tuple(
-            self.register_module(
-                f"encoder.{i}", _ResidualBlock(hidden_dim, rng, optimized_linear_backward, requires_grad)
-            )
+            self.register_module(f"encoder.{i}", _ResidualBlock(hidden_dim, rng, linear, requires_grad))
             for i in range(num_blocks)
         )
         self.post_norm = self.register_module("post_norm", _UnitRMSNorm(hidden_dim, requires_grad))
@@ -269,10 +274,10 @@ class _Backbone(_FlashNetwork):
 
 
 class _ActorHead(nn.Module):
-    def __init__(self, hidden_dim, action_dim, rng, optimized_linear_backward, requires_grad):
+    def __init__(self, hidden_dim, action_dim, rng, linear, requires_grad):
         super().__init__(requires_grad=requires_grad)
-        self.mean_w = _UnitLinear(hidden_dim, action_dim, rng, optimized_linear_backward, requires_grad)
-        self.std_w = _UnitLinear(hidden_dim, action_dim, rng, optimized_linear_backward, requires_grad)
+        self.mean_w = _UnitLinear(hidden_dim, action_dim, rng, linear, requires_grad)
+        self.std_w = _UnitLinear(hidden_dim, action_dim, rng, linear, requires_grad)
         self.mean_bias = nn.Parameter(wp.zeros(action_dim, device=self.device), requires_grad=requires_grad)
         self.std_bias = nn.Parameter(wp.zeros(action_dim, device=self.device), requires_grad=requires_grad)
         super().__post_init__()
@@ -314,14 +319,16 @@ class FlashActor(_Backbone):
         device: str | wp.Device | None = None,
         optimized_linear_backward: bool = True,
         requires_grad: bool = True,
+        dense_backend: str = "warp",
     ):
+        linear = _linear_type(dense_backend, optimized_linear_backward)
         if min(observation_dim, action_dim, hidden_dim) <= 0 or num_blocks < 0:
             raise ValueError("Network dimensions must be positive and block count nonnegative.")
         with wp.ScopedDevice(device):
             rng = np.random.default_rng(seed)
-            super().__init__(observation_dim, hidden_dim, num_blocks, rng, optimized_linear_backward, requires_grad)
+            super().__init__(observation_dim, hidden_dim, num_blocks, rng, linear, requires_grad)
             self.predictor = self.register_module(
-                "predictor", _ActorHead(hidden_dim, action_dim, rng, optimized_linear_backward, requires_grad)
+                "predictor", _ActorHead(hidden_dim, action_dim, rng, linear, requires_grad)
             )
             self.observation_dim = observation_dim
             self.action_dim = action_dim
@@ -339,9 +346,9 @@ class FlashActor(_Backbone):
 
 
 class _ValueHead(nn.Module):
-    def __init__(self, hidden_dim, num_bins, min_v, max_v, rng, optimized_linear_backward, requires_grad):
+    def __init__(self, hidden_dim, num_bins, min_v, max_v, rng, linear, requires_grad):
         super().__init__(requires_grad=requires_grad)
-        self.w = _UnitLinear(hidden_dim, num_bins, rng, optimized_linear_backward, requires_grad)
+        self.w = _UnitLinear(hidden_dim, num_bins, rng, linear, requires_grad)
         self.bias = nn.Parameter(wp.zeros(num_bins, device=self.device), requires_grad=requires_grad)
         self.bin_values = nn.Buffer(wp.array(np.linspace(min_v, max_v, num_bins, dtype=np.float32), device=self.device))
         self.log_softmax = LogSoftmax(dim=-1, requires_grad=requires_grad)
@@ -370,12 +377,10 @@ class _ValueHead(nn.Module):
 
 
 class _ValueNetwork(_Backbone):
-    def __init__(
-        self, input_dim, hidden_dim, num_blocks, num_bins, min_v, max_v, rng, optimized_linear_backward, requires_grad
-    ):
-        super().__init__(input_dim, hidden_dim, num_blocks, rng, optimized_linear_backward, requires_grad)
+    def __init__(self, input_dim, hidden_dim, num_blocks, num_bins, min_v, max_v, rng, linear, requires_grad):
+        super().__init__(input_dim, hidden_dim, num_blocks, rng, linear, requires_grad)
         self.predictor = self.register_module(
-            "predictor", _ValueHead(hidden_dim, num_bins, min_v, max_v, rng, optimized_linear_backward, requires_grad)
+            "predictor", _ValueHead(hidden_dim, num_bins, min_v, max_v, rng, linear, requires_grad)
         )
 
     def __call__(self, input: wp.array) -> tuple[wp.array, wp.array]:
@@ -405,7 +410,9 @@ class FlashDoubleCritic(_FlashNetwork):
         device: str | wp.Device | None = None,
         optimized_linear_backward: bool = True,
         requires_grad: bool = True,
+        dense_backend: str = "warp",
     ):
+        linear = _linear_type(dense_backend, optimized_linear_backward)
         if min(observation_dim, action_dim, hidden_dim) <= 0 or num_blocks < 0 or num_bins < 2 or min_v >= max_v:
             raise ValueError("Invalid categorical critic dimensions or support.")
         with wp.ScopedDevice(device):
@@ -422,7 +429,7 @@ class FlashDoubleCritic(_FlashNetwork):
                         min_v,
                         max_v,
                         rng,
-                        optimized_linear_backward,
+                        linear,
                         requires_grad,
                     ),
                 )

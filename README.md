@@ -106,6 +106,15 @@ The current G1 MuJoCo Warp setup does not provide that path. See
 [differentiable learning](docs/differentiable.md) for the separate experimental
 Cartpole prototype, solver limitations, and a minimal route to a hybrid learner.
 
+## Experimental native CUDA learning kernels
+
+The optional [CUDA backend](docs/cuda.md) replaces dense forward/backward and
+Adam in both Warp learners, preserving their current networks and losses. It
+uses cuBLASLt matrix products plus original CUDA bias-gradient and multi-tensor
+Adam kernels, persistent Warp-owned arrays, and CUDA graph capture. It does not
+depend on Torch. CUDA development tools are required when first building it.
+This is experimental; inspect the numerical and timing results before adopting it.
+
 ## Credits
 
 **FlashSAC** — Donghu Kim, Youngdo Lee, Minho Park, Kinam Kim, I Made Aswin Nahendra,

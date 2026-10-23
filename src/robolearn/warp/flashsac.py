@@ -337,7 +337,10 @@ class WarpFlashSAC:
         critic_observation_dim: int | None = None,
         *,
         optimized_linear_backward: bool = True,
+        dense_backend: str = "warp",
     ):
+        if dense_backend not in ("warp", "cuda"):
+            raise ValueError("dense_backend must be 'warp' or 'cuda'.")
         cfg = cfg or FlashSACConfig()
         if cfg.use_amp:
             raise ValueError("WarpFlashSAC currently implements FP32 only; set use_amp=False.")
@@ -368,6 +371,7 @@ class WarpFlashSAC:
         self.num_envs = num_envs
         self.batch_size = cfg.sample_batch_size
         self.optimized_linear_backward = optimized_linear_backward
+        self.dense_backend = dense_backend
         self._update_step = 0
         self._prepared = False
         self._update_graphs = {}
@@ -381,6 +385,7 @@ class WarpFlashSAC:
                 seed=cfg.seed,
                 device=self.device,
                 optimized_linear_backward=optimized_linear_backward,
+                dense_backend=dense_backend,
             )
             critic_args = (
                 total_dim,
@@ -396,12 +401,14 @@ class WarpFlashSAC:
                 seed=cfg.seed + 1,
                 device=self.device,
                 optimized_linear_backward=optimized_linear_backward,
+                dense_backend=dense_backend,
             )
             self.target_critic = FlashDoubleCritic(
                 *critic_args,
                 seed=cfg.seed + 1,
                 device=self.device,
                 optimized_linear_backward=optimized_linear_backward,
+                dense_backend=dense_backend,
                 requires_grad=False,
             )
             self.target_critic.load_state_dict(self.critic.state_dict())
@@ -473,7 +480,13 @@ class WarpFlashSAC:
         }
 
     def _optimizer(self, parameters):
-        return optimizers.Adam(
+        if self.dense_backend == "cuda":
+            from robolearn.cuda import CudaAdam
+
+            adam = CudaAdam
+        else:
+            adam = optimizers.Adam
+        return adam(
             parameters,
             lr=self.cfg.learning_rate_init,
             device=self.device,
@@ -970,6 +983,7 @@ class WarpFlashSAC:
             "num_envs": self.num_envs,
             "config": asdict(self.cfg),
             "optimized_linear_backward": self.optimized_linear_backward,
+            "dense_backend": self.dense_backend,
             "replay_included": include_replay,
         }
         state = self.state_dict(include_replay=include_replay)
