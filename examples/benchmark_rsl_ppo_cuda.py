@@ -70,7 +70,14 @@ def finite_state(value):
 
 def same_state(left, right):
     if isinstance(left, torch.Tensor):
-        return isinstance(right, torch.Tensor) and torch.equal(left, right)
+        # Checkpoint map_location can move Adam's scalar step tensors while
+        # preserving their values. Check exact values/dtypes outside timing.
+        return (
+            isinstance(right, torch.Tensor)
+            and left.dtype == right.dtype
+            and left.shape == right.shape
+            and torch.equal(left.detach().cpu(), right.detach().cpu())
+        )
     if isinstance(left, dict):
         return left.keys() == right.keys() and all(same_state(left[key], right[key]) for key in left)
     if isinstance(left, (list, tuple)):
