@@ -31,3 +31,4 @@ class PPOConfig:
     advantage_sample_std: bool = False
     timeout_bootstrap: str = "next"
     separate_grad_clipping: bool = False
+    dense_backend: str = "warp"

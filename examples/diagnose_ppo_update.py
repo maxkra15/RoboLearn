@@ -24,6 +24,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--linear-backward", choices=("stock", "tiled"), default="tiled")
+    parser.add_argument("--dense-backend", choices=("warp", "cuda"), default="warp")
     args = parser.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
     wp.init()
@@ -43,6 +44,7 @@ def main():
         timeout_bootstrap="current",
         separate_grad_clipping=True,
         optimized_linear_backward=args.linear_backward == "tiled",
+        dense_backend=args.dense_backend,
     )
     agent = WarpPPO(7, 3, 16, 4, cfg)
     initial = agent.state_dict()
@@ -178,7 +180,8 @@ def main():
     health = agent.health_metrics()
     finite = all(np.isfinite(value).all() for value in captured.values())
     result = {
-        "linear_backward": args.linear_backward,
+        "linear_backward": args.linear_backward if args.dense_backend == "warp" else "native_cuda",
+        "dense_backend": args.dense_backend,
         "returns_max_abs_error": returns_error,
         "advantages_max_abs_error": advantages_error,
         "eager_capture_all_state_max_abs_error": capture_error,

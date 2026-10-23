@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Holiday Robotics
 # SPDX-FileCopyrightText: Copyright (c) 2026 RoboLearn contributors
 # SPDX-License-Identifier: MIT
-"""Experimental FP32 FlashSAC updates in Warp-NN.
+"""Experimental FlashSAC updates in Warp-NN with optional native CUDA operations.
 
 Adapted from Holiday-Robot/FlashSAC, revision
 87edc9061150ae9e962dd84e6544e27a1554b3ab, accompanying
 https://arxiv.org/abs/2604.04539. The actor, temperature, distributional critic
 and target update order follows the authors' implementation. Warp-NN supplies
-the neural layers and Adam. FP16 AMP is not implemented by this backend.
+the neural storage. The native backend additionally supports FP16 dense compute,
+FP32 master weights and Adam, dynamic loss scaling, and fused normalization.
 
 Returned actions, sampled batches and device metrics use persistent storage.
 Consume or copy them before the next call that reuses the same output. Random
@@ -20,6 +21,7 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import asdict, replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import warp as wp
@@ -238,7 +240,7 @@ def _ema(source: wp.array(dtype=wp.float32), target: wp.array(dtype=wp.float32),
 
 @wp.kernel(enable_backward=False)
 def _schedule(
-    timestep: wp.array(dtype=wp.float32),
+    timestep: wp.array(dtype=Any),
     initial: float,
     peak: float,
     end: float,
@@ -246,7 +248,7 @@ def _schedule(
     decay_steps: int,
     learning_rate: wp.array(dtype=wp.float32),
 ):
-    step = timestep[0]
+    step = float(timestep[0])
     value = end
     if step < float(warmup_steps):
         value = initial + (peak - initial) * step / float(warmup_steps)
@@ -337,10 +339,14 @@ class WarpFlashSAC:
         critic_observation_dim: int | None = None,
         *,
         optimized_linear_backward: bool = True,
+        dense_backend: str = "warp",
+        fused_updates: bool = False,
     ):
+        if dense_backend not in ("warp", "cuda"):
+            raise ValueError("dense_backend must be 'warp' or 'cuda'.")
         cfg = cfg or FlashSACConfig()
-        if cfg.use_amp:
-            raise ValueError("WarpFlashSAC currently implements FP32 only; set use_amp=False.")
+        if (cfg.use_amp or fused_updates) and dense_backend != "cuda":
+            raise ValueError("Mixed precision and fused updates require dense_backend='cuda'.")
         if min(observation_dim, action_dim, num_envs) < 1:
             raise ValueError("Observation, action and environment dimensions must be positive.")
         total_dim = critic_observation_dim or observation_dim
@@ -358,7 +364,7 @@ class WarpFlashSAC:
         )
         self.device = wp.get_device(cfg.device)
         warnings.warn(
-            "WarpFlashSAC is an experimental FP32 backend; policy quality and speed must be measured for your task.",
+            "WarpFlashSAC is experimental; policy quality and speed must be measured for your task.",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -368,6 +374,9 @@ class WarpFlashSAC:
         self.num_envs = num_envs
         self.batch_size = cfg.sample_batch_size
         self.optimized_linear_backward = optimized_linear_backward
+        self.dense_backend = dense_backend
+        self.fused_updates = fused_updates
+        self.compute_dtype = "float16" if cfg.use_amp else "float32"
         self._update_step = 0
         self._prepared = False
         self._update_graphs = {}
@@ -381,6 +390,9 @@ class WarpFlashSAC:
                 seed=cfg.seed,
                 device=self.device,
                 optimized_linear_backward=optimized_linear_backward,
+                dense_backend=dense_backend,
+                compute_dtype=self.compute_dtype,
+                fused_updates=fused_updates,
             )
             critic_args = (
                 total_dim,
@@ -396,18 +408,24 @@ class WarpFlashSAC:
                 seed=cfg.seed + 1,
                 device=self.device,
                 optimized_linear_backward=optimized_linear_backward,
+                dense_backend=dense_backend,
+                compute_dtype=self.compute_dtype,
+                fused_updates=fused_updates,
             )
             self.target_critic = FlashDoubleCritic(
                 *critic_args,
                 seed=cfg.seed + 1,
                 device=self.device,
                 optimized_linear_backward=optimized_linear_backward,
+                dense_backend=dense_backend,
+                compute_dtype=self.compute_dtype,
+                fused_updates=fused_updates,
                 requires_grad=False,
             )
             self.target_critic.load_state_dict(self.critic.state_dict())
             self.log_temperature = wp.array([math.log(cfg.temp_initial_value)], dtype=wp.float32, requires_grad=True)
-            self.actor_optimizer = self._optimizer(self.actor.parameters())
-            self.critic_optimizer = self._optimizer(self.critic.parameters())
+            self.actor_optimizer = self._optimizer(self.actor.parameters(), scaled=cfg.use_amp)
+            self.critic_optimizer = self._optimizer(self.critic.parameters(), scaled=cfg.use_amp)
             self.temperature_optimizer = self._optimizer([self.log_temperature])
             self.update_counters = wp.zeros(3, dtype=wp.int64)
             self._replay_buffer = WarpFlashReplay(total_dim, action_dim, num_envs, self.cfg, self.device)
@@ -462,6 +480,15 @@ class WarpFlashSAC:
         if set(source) != set(target):
             raise ValueError("Online and target critic parameter names differ.")
         self._ema_parameters = [(source[name].data.flatten(), target[name].data.flatten()) for name in source]
+        self._fused_ema = None
+        if fused_updates:
+            from robolearn.cuda.flash import CudaEMA
+
+            self._fused_ema = CudaEMA(
+                sources=[pair[0] for pair in self._ema_parameters],
+                targets=[pair[1] for pair in self._ema_parameters],
+                tau=cfg.critic_target_update_tau,
+            ).prepare()
         self.metrics = {
             "actor/loss": self.actor_loss,
             "actor/entropy": self.entropy,
@@ -472,14 +499,23 @@ class WarpFlashSAC:
             "temperature/value": self.temperature_value,
         }
 
-    def _optimizer(self, parameters):
-        return optimizers.Adam(
+    def _optimizer(self, parameters, *, scaled=False):
+        if self.dense_backend == "cuda":
+            from robolearn.cuda import CudaAdam
+
+            adam = CudaAdam
+            options = {"dynamic_loss_scale": scaled}
+        else:
+            adam = optimizers.Adam
+            options = {}
+        return adam(
             parameters,
             lr=self.cfg.learning_rate_init,
             device=self.device,
             disable_graph=True,
             betas=(0.9, 0.999),
             eps=1.0e-8,
+            **options,
         )
 
     def parameters(self) -> list[wp.array]:
@@ -502,7 +538,11 @@ class WarpFlashSAC:
         wp.launch(
             _actor_prefix, dim=actor_observations.shape, inputs=[observations, actor_observations], device=self.device
         )
-        mean, log_std = self.actor(actor_observations, training=False)
+        if self.cfg.use_amp:
+            with self.actor.precision("float32"):
+                mean, log_std = self.actor(actor_observations, training=False)
+        else:
+            mean, log_std = self.actor(actor_observations, training=False)
         if training:
             wp.launch(
                 _exploration_repeat,
@@ -554,11 +594,12 @@ class WarpFlashSAC:
 
     def _schedule_optimizer(self, optimizer) -> None:
         cfg = self.cfg
+        timestep = optimizer.attempted_steps if getattr(optimizer, "dynamic_loss_scale", False) else optimizer._timestep
         wp.launch(
             _schedule,
             dim=1,
             inputs=[
-                optimizer._timestep,
+                timestep,
                 cfg.learning_rate_init,
                 cfg.learning_rate_peak,
                 cfg.learning_rate_end,
@@ -572,8 +613,18 @@ class WarpFlashSAC:
     def _step(self, optimizer) -> None:
         self._schedule_optimizer(optimizer)
         optimizer.step()
-        # Saved LR has the same post-step scheduler position as Torch LambdaLR.
+        # Scheduler follows attempted updates, including skipped FP16 steps.
         self._schedule_optimizer(optimizer)
+
+    def _backward(self, tape, loss, optimizer, *, scaled=True) -> None:
+        if scaled and getattr(optimizer, "dynamic_loss_scale", False):
+            # Tape copies this seed into the loss's independent gradient array.
+            # Loss scale state must never be aliased to a gradient cleared by zero().
+            if loss.grad is None or loss.grad.ptr == optimizer.loss_scale.ptr:
+                raise RuntimeError("Scaled loss requires an independent persistent gradient array.")
+            tape.backward(grads={loss: optimizer.loss_scale})
+        else:
+            tape.backward(loss)
 
     def _update_actor(self, apply_optimizer: bool) -> None:
         self.actor_loss.zero_()
@@ -621,7 +672,7 @@ class WarpFlashSAC:
                     outputs=[self.actor_loss],
                     device=self.device,
                 )
-            tape.backward(self.actor_loss)
+            self._backward(tape, self.actor_loss, self.actor_optimizer, scaled=apply_optimizer)
             if apply_optimizer:
                 self._step(self.actor_optimizer)
                 self.actor.normalize_parameters()
@@ -701,7 +752,7 @@ class WarpFlashSAC:
                 outputs=[self.critic_loss],
                 device=self.device,
             )
-        tape.backward(self.critic_loss)
+        self._backward(tape, self.critic_loss, self.critic_optimizer, scaled=apply_optimizer)
         if apply_optimizer:
             self._step(self.critic_optimizer)
             self.critic.normalize_parameters()
@@ -754,13 +805,16 @@ class WarpFlashSAC:
             wp.launch(_normal_noise, dim=self.batch_size, inputs=[self._next_rng, self.next_noise], device=self.device)
         self._update_critic(reward, apply_optimizer)
         if apply_optimizer:
-            for source, target in self._ema_parameters:
-                wp.launch(
-                    _ema,
-                    dim=source.size,
-                    inputs=[source, target, self.cfg.critic_target_update_tau],
-                    device=self.device,
-                )
+            if self._fused_ema is not None:
+                self._fused_ema.step()
+            else:
+                for source, target in self._ema_parameters:
+                    wp.launch(
+                        _ema,
+                        dim=source.size,
+                        inputs=[source, target, self.cfg.critic_target_update_tau],
+                        device=self.device,
+                    )
             wp.launch(_advance_updates, dim=1, inputs=[self.update_counters, int(do_actor_update)], device=self.device)
 
     def update_from_batch(
@@ -871,6 +925,11 @@ class WarpFlashSAC:
             critic_optimizer_steps=float(self.critic_optimizer._timestep.numpy()[0]),
             temperature_optimizer_steps=float(self.temperature_optimizer._timestep.numpy()[0]),
         )
+        for name, optimizer in (("actor", self.actor_optimizer), ("critic", self.critic_optimizer)):
+            if getattr(optimizer, "dynamic_loss_scale", False):
+                result[f"{name}_amp_loss_scale"] = float(optimizer.loss_scale.numpy()[0])
+                result[f"{name}_optimizer_attempts"] = int(optimizer.attempted_steps.numpy()[0])
+                result[f"{name}_optimizer_skips"] = int(optimizer.skipped_steps.numpy()[0])
         return result
 
     def _clear_gradients(self) -> None:
@@ -904,6 +963,8 @@ class WarpFlashSAC:
             arrays.update({f"optimizer.{name}.m2.{i}": value for i, value in enumerate(optimizer._m2)})
             arrays[f"optimizer.{name}.timestep"] = optimizer._timestep
             arrays[f"optimizer.{name}.lr"] = optimizer._lr
+            if getattr(optimizer, "dynamic_loss_scale", False):
+                arrays.update({f"optimizer.{name}.amp.{key}": value for key, value in optimizer.state_arrays().items()})
         arrays.update(
             {
                 "log_temperature": self.log_temperature,
@@ -963,13 +1024,15 @@ class WarpFlashSAC:
         directory.mkdir(parents=True, exist_ok=True)
         metadata = {
             "format": "robolearn-warp-flashsac-v1",
-            "precision": "float32",
+            "precision": self.compute_dtype,
             "observation_dim": self.observation_dim,
             "action_dim": self.action_dim,
             "critic_observation_dim": self.critic_observation_dim if self.cfg.asymmetric_observation else None,
             "num_envs": self.num_envs,
             "config": asdict(self.cfg),
             "optimized_linear_backward": self.optimized_linear_backward,
+            "dense_backend": self.dense_backend,
+            "fused_updates": self.fused_updates,
             "replay_included": include_replay,
         }
         state = self.state_dict(include_replay=include_replay)
@@ -992,6 +1055,8 @@ class WarpFlashSAC:
         saved_critic_dim = metadata["critic_observation_dim"] or metadata["observation_dim"]
         if saved_critic_dim != self.critic_observation_dim:
             raise ValueError("Checkpoint critic observation dimension differs from this agent.")
+        if metadata.get("precision", "float32") != self.compute_dtype and self.cfg.load_optimizer:
+            raise ValueError("Switching checkpoint dense precision requires load_optimizer=False.")
         with np.load(directory / "agent.npz", allow_pickle=False) as archive:
             state = dict(archive)
         if metadata["replay_included"] and metadata["num_envs"] != self.num_envs:

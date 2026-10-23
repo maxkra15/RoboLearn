@@ -78,11 +78,16 @@ def main():
     parser.add_argument("--actor-calls", type=int, default=100)
     parser.add_argument("--torch-compile", action="store_true")
     parser.add_argument("--torch-amp", action="store_true")
+    parser.add_argument("--disable-tf32", action="store_true")
+    parser.add_argument("--dense-backend", choices=("warp", "cuda"), default="warp")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if min(args.warmup, args.updates, args.actor_calls) < 1:
         parser.error("Measurement and warmup counts must be positive.")
     torch.set_num_threads(8)
+    if args.disable_tf32:
+        torch.set_float32_matmul_precision("highest")
+        torch.backends.cuda.matmul.allow_tf32 = False
     device = torch.device(args.device)
     torch.manual_seed(0)
     wp.init()
@@ -175,6 +180,7 @@ def main():
                 args.actions,
                 num_envs=args.num_envs,
                 cfg=replace(cfg, use_compile=False, use_amp=False),
+                dense_backend=args.dense_backend,
             )
             torch.cuda.synchronize(device)
             construction = time.perf_counter() - start
@@ -215,6 +221,7 @@ def main():
             records.append(
                 {
                     "backend": "warp_nn",
+                    "dense_backend": args.dense_backend,
                     "precision": "fp32",
                     "captured": captured,
                     "actor_captured": False,
@@ -236,6 +243,8 @@ def main():
         "scope": "Isolated learner components; no simulator, MDP, or walking evaluation.",
         "gpu": torch.cuda.get_device_name(device),
         "torch": torch.__version__,
+        "torch_float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "torch_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
         "warp": wp.__version__,
         "warp_nn": warp_nn.__version__,
         "config": asdict(cfg),

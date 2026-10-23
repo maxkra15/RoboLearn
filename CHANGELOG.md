@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Added opt-in FP16 dense compute with FP32 master weights and Adam, dynamic
+  loss scaling, and fused normalization/ReLU, parameter projections and target
+  EMA for the experimental native FlashSAC backend.
+- Added opt-in experimental native CUDA dense forward/backward and fused
+  multi-tensor Adam for Warp PPO and Warp FlashSAC, with unchanged architectures,
+  loss definitions, optimizer state arrays, and default Warp backend.
+- Added standalone numerical diagnostics and synthetic update benchmarks for
+  the CUDA backend; performance and learning quality require measured results.
 - Load Warp learners lazily so selecting PPO does not import experimental FlashSAC.
 - Allow `PPOConfig` imports without installing Torch, Warp, or Warp-NN; preserve
   existing public imports and configuration defaults.
