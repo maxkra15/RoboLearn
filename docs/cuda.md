@@ -288,6 +288,11 @@ with the runtime versions above. Each row has three continuous-state blocks of
 means, including the default host scalar metrics. Compilation, checkpointing
 and profiling are outside measured update time.
 
+Initial weights match the pristine author weights exactly within each command.
+Across the three command processes, 19 normalized dense arrays differ by at
+most `5.96e-8`; the transition fixture is bit-identical. Comparisons within each
+command retain matched initialization.
+
 | Implementation | Precision | Fusions | Milliseconds per call |
 | --- | --- | --- | ---: |
 | Official FlashSAC, networks eager | Strict FP32 | Upstream helpers | 12.048 |
