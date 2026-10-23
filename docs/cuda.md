@@ -278,3 +278,77 @@ The native CUDA code is original RoboLearn code. Algorithm authors and upstream
 FlashSAC attribution remain in [ATTRIBUTION.md](../ATTRIBUTION.md) and
 [CITATIONS.bib](../CITATIONS.bib). Warp-NN and NVIDIA CUDA libraries retain their
 respective licenses.
+
+### FlashSAC fusion and mixed precision, 23 October 2026
+
+Source: [`35f9bf1`](https://github.com/maxkra15/RoboLearn/commit/35f9bf14ff8065e3befe85640ce6f7c8313de699).
+This follow-up keeps the G1-shaped architecture and batch size above, on one L40
+with the runtime versions above. Each row has three continuous-state blocks of
+20 warm calls and 100 measured calls. Values are medians of synchronized block
+means, including the default host scalar metrics. Compilation, checkpointing
+and profiling are outside measured update time.
+
+| Implementation | Precision | Fusions | Milliseconds per call |
+| --- | --- | --- | ---: |
+| Official FlashSAC, networks eager | Strict FP32 | Upstream helpers | 12.048 |
+| RoboLearn Torch port, eager | Strict FP32 | Disabled | 11.878 |
+| Native CUDA | Strict FP32 | Disabled | 13.032 |
+| Native CUDA | Strict FP32 | Enabled | 6.477 |
+| Native CUDA | FP16 dense operands, FP32 state | Disabled | 11.026 |
+| Native CUDA | FP16 dense operands, FP32 state | Enabled | 4.557 |
+
+Fusion reduces native FP32 call time by about half. Fusion plus mixed precision
+achieves a **2.86x speedup over the previous native FP32 path**. The fusion bundle
+includes native normalization, BN+ReLU, parameter projections and target EMA;
+this experiment does not isolate each component's contribution. All rows
+completed 300 critic, 150 actor and 150 temperature updates, with zero skipped
+optimizer attempts.
+
+Separate compiled controls use the same budgets and metric cadence:
+
+| Implementation | Compiled FP32 control, ms/call | Authors' AMP recipe, ms/call |
+| --- | ---: | ---: |
+| Official FlashSAC | 5.198 | 3.917 |
+| RoboLearn Torch port | 5.199 | 4.091 |
+| Native CUDA, fused | 6.500, strict FP32 | 4.499, FP16 dense / FP32 state |
+
+Compiled Torch is faster than native fusion at the same FP32 precision in this
+fixture. Native mixed precision with fusion takes about **14.8% longer than the
+official optimized AMP recipe**, and about 10% longer than the Torch port. The
+native improvement therefore narrows the gap without surpassing upstream. TF32
+is disabled for the compiled FP32 control and allowed for the authors' AMP
+recipe; the native paths do not use TF32. Repeated native fused measurements
+across these processes were 6.48--6.50 ms in FP32 and 4.49--4.56 ms with FP16
+dense operands. These ordered measurements share caches and are not independent
+training runs or confidence intervals.
+
+The official first-block warmup took 1,319.7 seconds for compiled FP32 and
+408.0 seconds for AMP, including compilation and autotuning. Subsequent rows
+and commands reuse caches. These are observed startup costs, not independently
+cold startup comparisons.
+
+Native mixed precision retains FP32 dense outputs, activations, normalization,
+adjoints and optimizer state. The authors' Torch autocast recipe rounds more
+intermediate values to FP16 and uses a shared scaler, whereas the native path
+uses independent actor and critic scales. These numerical recipes are distinct.
+
+Untimed profiles recorded 4,848 kernel events across eight native FP32 calls,
+versus 2,584 with fusion. The fused mixed-precision path recorded 3,416 events,
+including 820 FP32-to-FP16 casts. Reducing those conversions is a further tuning
+opportunity; event counts do not establish runtime shares or predict a speedup.
+Profiling restored learner state exactly and is excluded from the timing table.
+
+All nine focused diagnostic stages passed: dense and normalization formulas,
+projection/EMA, dynamic-scaler overflow handling, eager/captured updates, exact
+checkpoint restoration and continued graph replay. Complete-learner floating
+differences are descriptive, with a loose loss-sanity gate; these checks do not
+establish strict Torch/native trajectory equivalence. No environment learning
+or policy quality was measured. This backend remains experimental.
+
+Run [the focused diagnostic](../examples/diagnose_cuda_flashsac.py), then
+[the upstream comparison](../examples/benchmark_official_flashsac.py) with
+`--native-variants fp32 fp32-fused amp amp-fused --profile-native` to reproduce
+the native ablations. Use `--compile-fp32` for the compiled FP32 control and
+`--recipe amp --allow-tf32` for the authors' AMP control. Pin the official source
+commit above and use `--blocks 3 --warmup 20 --updates 100 --actor-calls 100`
+for the recorded budgets.

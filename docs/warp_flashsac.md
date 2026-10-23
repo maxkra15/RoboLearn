@@ -45,7 +45,9 @@ also shows several concrete differences from the Torch path:
   ensemble operations.
 - Fixed-order normalization and LogSoftmax backward reductions favor predictable
   accumulation. They are not fused with neighboring layers.
-- The port is FP32 only, while the fastest Torch recipe uses compiled FP16 AMP.
+- The default Warp dense backend is FP32, while the fastest Torch recipe uses
+  compiled FP16 AMP. The optional native backend adds mixed precision as described
+  above.
 
 The older profiler below identifies dense math as the first optimization target.
 It is not a fresh kernel breakdown of Warp-NN 0.4.1, so the current timing gap
