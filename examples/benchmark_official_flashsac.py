@@ -13,6 +13,7 @@ import ast
 import hashlib
 import importlib
 import importlib.metadata
+import io
 import json
 import os
 import platform
@@ -181,6 +182,28 @@ def torch_state(agent):
     }
 
 
+def initial_weights(path, reference):
+    """Load a canonical export without coercing its architecture, dtypes or values."""
+    path = path.expanduser().resolve(strict=True)
+    payload = path.read_bytes()
+    with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
+        if len(archive.files) != len(reference) or set(archive.files) != set(reference):
+            raise RuntimeError("Initial-weight keys must exactly match the pristine official network state.")
+        state = {}
+        for key, expected in reference.items():
+            value = archive[key]
+            if value.shape != expected.shape or value.dtype != expected.dtype or not np.isfinite(value).all():
+                raise RuntimeError(f"Initial weight {key!r} must match the official shape/dtype and be finite.")
+            state[key] = np.array(value, copy=True, order="C")
+    return state, {
+        "kind": "canonical_npz",
+        "path": str(path),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "array_count": len(state),
+        "validated_keys_shapes_dtypes_and_finiteness": True,
+    }
+
+
 def load_common_weights(agent, state):
     if isinstance(agent, WarpFlashSAC):
         for name in ("actor", "critic", "target_critic"):
@@ -188,19 +211,41 @@ def load_common_weights(agent, state):
                 {key.removeprefix(name + "."): value for key, value in state.items() if key.startswith(name + ".")}
             )
         agent.log_temperature.assign(state["temperature.log_temp"])
-        return
-    for name in ("actor", "critic", "target_critic", "temperature"):
-        network = raw_module(getattr(agent, f"_{name}"))
-        network.load_state_dict(
-            {
-                key.removeprefix(name + "."): torch.as_tensor(value, device=next(network.parameters()).device)
-                for key, value in state.items()
-                if key.startswith(name + ".")
-            }
-        )
-    loaded = torch_state(agent)
-    if any(not np.array_equal(value, loaded[key]) for key, value in state.items()):
-        raise RuntimeError("Common Torch model weights/buffers were not loaded exactly.")
+        loaded = {f"actor.{key}": value.numpy().copy() for key, value in agent.actor.state_dict().items()}
+        for name in ("critic", "target_critic"):
+            children = [critic.state_dict() for critic in getattr(agent, name).critics]
+            if len(children) != 2 or set(children[0]) != set(children[1]):
+                raise RuntimeError("Native readback requires matching twin-critic states.")
+            for key in children[0]:
+                source = (
+                    key.replace(".w.w.weight", ".w.weight")
+                    .replace(".w1.w.weight", ".w1.weight")
+                    .replace(".w2.w.weight", ".w2.weight")
+                )
+                values = [child[key].numpy().copy() for child in children]
+                if key == "predictor.bin_values":
+                    if array_hash(values[0]) != array_hash(values[1]):
+                        raise RuntimeError("Native twin-critic categorical supports differ.")
+                    value = values[0].reshape(state[f"{name}.{source}"].shape)
+                else:
+                    value = np.stack(values, axis=0)
+                loaded[f"{name}.{source}"] = value
+        loaded["temperature.log_temp"] = agent.log_temperature.numpy().copy()
+    else:
+        for name in ("actor", "critic", "target_critic", "temperature"):
+            network = raw_module(getattr(agent, f"_{name}"))
+            network.load_state_dict(
+                {
+                    key.removeprefix(name + "."): torch.as_tensor(value, device=next(network.parameters()).device)
+                    for key, value in state.items()
+                    if key.startswith(name + ".")
+                }
+            )
+        loaded = torch_state(agent)
+    hashes = {key: array_hash(value) for key, value in loaded.items()}
+    if hashes != {key: array_hash(value) for key, value in state.items()}:
+        raise RuntimeError("Common model weights/buffers were not loaded exactly.")
+    return {"exactly_equal": True, "array_count": len(loaded), "hashes": hashes}
 
 
 def parameter_state(agent):
@@ -328,7 +373,7 @@ def run_backend(agent, name, args, transitions, common_weights, reference_replay
     result["records"].append(row)
     write_json(args.output, result)
     start = time.perf_counter()
-    load_common_weights(agent, common_weights)
+    row["common_initial_weights_audit"] = load_common_weights(agent, common_weights)
     torch.cuda.synchronize(device)
     row["common_weight_loading_seconds"] = time.perf_counter() - start
     initial = parameter_state(agent)
@@ -560,6 +605,14 @@ def main():
         "--profile-native", action="store_true", help="Export an untimed CUDA kernel trace per native row."
     )
     parser.add_argument(
+        "--initial-weights", type=Path, help="Load a common-initial-weights.npz export for exact initialization reuse."
+    )
+    parser.add_argument(
+        "--only-native",
+        action="store_true",
+        help="Time native variants only; construct pristine official FlashSAC for weights and replay reference.",
+    )
+    parser.add_argument(
         "--allow-tf32",
         action="store_true",
         help="Use authors' launcher Torch TF32/high/cuDNN-benchmark policy; native stays FP32.",
@@ -593,12 +646,21 @@ def main():
         "status": "RUNNING",
         "scope": "Synthetic standalone learner components; no physics, rollout learning, or policy-quality results.",
         "arguments": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
+        "benchmark_source": {
+            "path": str(Path(__file__).resolve()),
+            "sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        },
         "records": [],
         "timing": "Synchronized wall time amortized over calls; default scalar metrics on every update in all rows.",
         "startup_scope": (
             "Construction, common-weight loading, replay ingestion, preparation, and warmup are separate. "
             "Shared fixture generation/export, source import/verification, CPU replay audits, and checkpoint "
-            "writing are excluded. Compiler caches are retained; fixed row order is official, port, native."
+            "writing are excluded. Compiler caches are retained; "
+            + (
+                "only native variants are timed; official construction/loading/ingestion supplies the reference."
+                if args.only_native
+                else "fixed row order is official, port, native."
+            )
         ),
         "limitations": [
             "No terminal or timeout fixtures: upstream and RoboLearn timeout-discount semantics differ.",
@@ -608,7 +670,7 @@ def main():
             "Native mixed precision therefore differs from Torch autocast intermediate rounding.",
             "Per-call CPU action copies are included in every actor row; simulator/device-only rollout performance is unmeasured.",
             "Single-process descriptive timings include Python/default logging overhead and cache/order effects.",
-            "Each timing block continues from the previous block; the three blocks are not three independent training seeds.",
+            "Timing blocks continue from the previous block and are not independent training seeds.",
             (
                 "Torch allows TF32/high matmul as in the authors' launcher; native FP32 remains pedantic."
                 if args.allow_tf32
@@ -644,7 +706,21 @@ def main():
                 name: importlib.metadata.version(name) for name in ("gymnasium", "omegaconf", "jax", "jaxlib")
             },
         }
-        package_root = Path(importlib.import_module("robolearn").__file__).parent
+        package_file = Path(importlib.import_module("robolearn").__file__).resolve(strict=True)
+        package_root = package_file.parent
+        expected_root = os.environ.get("ROBOLEARN_EXPECTED_PACKAGE_ROOT")
+        result["robolearn_provenance"] = {
+            "imported_package_file": str(package_file),
+            "imported_package_root": str(package_root),
+            "expected_library_commit": os.environ.get("ROBOLEARN_LIBRARY_COMMIT"),
+            "commit_provenance": "Caller-declared ROBOLEARN_LIBRARY_COMMIT; imported source hashes are recorded separately.",
+            "expected_package_root": expected_root,
+            "expected_package_root_matches": (
+                package_root == Path(expected_root).expanduser().resolve(strict=True) if expected_root else None
+            ),
+        }
+        if result["robolearn_provenance"]["expected_package_root_matches"] is False:
+            raise RuntimeError("Imported RoboLearn package differs from ROBOLEARN_EXPECTED_PACKAGE_ROOT.")
         result["robolearn_sources_sha256"] = {
             str(path.relative_to(package_root)): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in sorted(package_root.rglob("*"))
@@ -679,6 +755,13 @@ def main():
         torch.cuda.synchronize(device)
         official_startup = {"construction_seconds": time.perf_counter() - start}
         common_weights = torch_state(official)
+        if args.initial_weights is not None:
+            common_weights, result["common_initial_weights_source"] = initial_weights(
+                args.initial_weights, common_weights
+            )
+            load_common_weights(official, common_weights)
+        else:
+            result["common_initial_weights_source"] = {"kind": "pristine_official_initialization"}
         np.savez(artifact_root / "common-initial-weights.npz", **common_weights)
         result["common_initial_weights"] = {key: array_hash(value) for key, value in common_weights.items()}
         rng = np.random.default_rng(args.seed + 1000)
@@ -700,33 +783,53 @@ def main():
         np.savez_compressed(artifact_root / "transition-fixture.npz", **flat_fixture)
         result["transition_fixture"] = {key: array_hash(value) for key, value in flat_fixture.items()}
         transitions = [{key: torch.as_tensor(value, device=device) for key, value in row.items()} for row in fixture]
-        reference_replay = run_backend(
-            official,
-            "official_flashsac",
-            args,
-            transitions,
-            common_weights,
-            None,
-            result,
-            artifact_root,
-            official_startup,
-        )
-        start = time.perf_counter()
-        port = FlashSAC(args.observations, args.actions, num_envs=args.num_envs, cfg=cfg)
-        torch.cuda.synchronize(device)
-        port_startup = {"construction_seconds": time.perf_counter() - start}
-        run_backend(
-            port,
-            "robolearn_torch_port",
-            args,
-            transitions,
-            common_weights,
-            reference_replay,
-            result,
-            artifact_root,
-            port_startup,
-        )
-        result["resolved_configs"] = {"official": asdict(official._cfg), "robolearn_torch": asdict(port._cfg)}
+        result["resolved_configs"] = {"official": asdict(official._cfg)}
+        if args.only_native:
+            start = time.perf_counter()
+            for transition in transitions:
+                official.process_transition(transition)
+            torch.cuda.synchronize(device)
+            reference_replay = replay_state(official)
+            reference_steps = optimizer_steps(official)
+            result["official_reference"] = {
+                **official_startup,
+                "replay_fill_seconds": time.perf_counter() - start,
+                "replay_transitions": len(official._replay_buffer),
+                "replay_hashes": {key: array_hash(value) for key, value in reference_replay.items()},
+                "agent_update_calls": official._update_step,
+                "optimizer_steps": reference_steps,
+                "timed_or_warmup_updates": False,
+            }
+            if official._update_step != 0 or any(reference_steps.values()):
+                raise RuntimeError("Reference-only official learner unexpectedly updated.")
+        else:
+            reference_replay = run_backend(
+                official,
+                "official_flashsac",
+                args,
+                transitions,
+                common_weights,
+                None,
+                result,
+                artifact_root,
+                official_startup,
+            )
+            start = time.perf_counter()
+            port = FlashSAC(args.observations, args.actions, num_envs=args.num_envs, cfg=cfg)
+            torch.cuda.synchronize(device)
+            port_startup = {"construction_seconds": time.perf_counter() - start}
+            run_backend(
+                port,
+                "robolearn_torch_port",
+                args,
+                transitions,
+                common_weights,
+                reference_replay,
+                result,
+                artifact_root,
+                port_startup,
+            )
+            result["resolved_configs"]["robolearn_torch"] = asdict(port._cfg)
         source_root = Path(importlib.import_module("robolearn.flashsac.agent").__file__).parent
         result["robolearn_compile_sites"] = {
             str(path.relative_to(source_root)): compile_sites(path)

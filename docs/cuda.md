@@ -50,6 +50,14 @@ order are preserved. Reduction order and mixed-precision rounding differ from
 Torch autocast. Batch-statistic and optimizer dependencies retain multiple
 ordered kernels inside each captured update graph.
 
+The fused path reuses FP16 weight copies across batch shapes. Projection and
+target EMA refresh them alongside their FP32 masters; author-state loading,
+checkpoint restoration and warmup restoration refresh them before reuse.
+Dense activations and adjoints use vectorized conversions. Cooperative
+categorical heads combine bias, log-softmax and expected value, with a matching
+combined backward; target distributions use shared-memory projection. These
+changes preserve the network and loss equations while changing reduction order.
+
 The options are independent: leave `use_amp=False` for a fusion-only experiment,
 or `fused_updates=False` to measure mixed precision with the original Warp
 normalization. The default remains FP32 with fusion disabled. Restore the same

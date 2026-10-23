@@ -8,11 +8,17 @@
 //     const void* const* second, const size_t* lengths, const int* kinds);
 // int rl_flash_projection_step(void* plan, void* stream);
 // int rl_flash_projection_destroy(void* plan);
+// void* rl_flash_projection_create_with_shadows(size_t count, const void* const* first,
+//     const void* const* second, const size_t* lengths, const int* kinds,
+//     const void* const* shadows);  // optional FP16 unit-linear row destinations
 // kinds: 0=unit Linear row, 1=joint BN affine vector, 2=RMS scale vector.
 // void* rl_flash_ema_create(size_t count, const void* const* source,
 //     const void* const* target, const size_t* lengths, float tau);
 // int rl_flash_ema_step(void* plan, void* stream);
 // int rl_flash_ema_destroy(void* plan);
+// void* rl_flash_ema_create_with_shadows(size_t count, const void* const* source,
+//     const void* const* target, const size_t* lengths, float tau,
+//     const void* const* shadows);  // optional FP16 target destinations
 //
 // Allocation-free normalization ABI (row-major B x C, all arrays FP32):
 // int rl_flash_bn_forward(x,w,b,running_mean,running_var,mean,var,partial,y,
@@ -31,6 +37,8 @@
 
 #pragma once
 
+#include <cuda_fp16.h>
+
 namespace {
 namespace flash_native {
 
@@ -38,18 +46,21 @@ constexpr int Threads = 256;
 constexpr int Channels = 32;
 constexpr int Groups = Threads / Channels;
 constexpr int Chunk = 256;
+constexpr int ApplyRows = 64;
 
 struct Projection {
     float* first;
     float* second;
     std::size_t length;
     int kind;
+    __half* shadow;
 };
 
 struct Pair {
     const float* source;
     float* target;
     std::size_t length;
+    __half* shadow;
 };
 
 template<class Descriptor>
@@ -105,7 +116,9 @@ __global__ void project(const Projection* descriptors) {
         : sqrtf(static_cast<float>(row.length)) / sqrtf(total + 1.0e-8f);
     __syncthreads();
     for (std::size_t i = threadIdx.x; i < row.length; i += Threads) {
-        row.first[i] = row.kind == 0 ? row.first[i] / factor : row.first[i] * factor;
+        const float normalized = row.kind == 0 ? row.first[i] / factor : row.first[i] * factor;
+        row.first[i] = normalized;
+        if (row.shadow) row.shadow[i] = __float2half_rn(normalized);
         if (row.kind == 1) row.second[i] *= factor;
     }
 }
@@ -113,7 +126,9 @@ __global__ void project(const Projection* descriptors) {
 __global__ void ema(const Pair* descriptors, float tau) {
     const Pair values = descriptors[blockIdx.x];
     for (std::size_t i = threadIdx.x; i < values.length; i += Threads) {
-        values.target[i] = (1.0f - tau) * values.target[i] + tau * values.source[i];
+        const float updated = (1.0f - tau) * values.target[i] + tau * values.source[i];
+        values.target[i] = updated;
+        if (values.shadow) values.shadow[i] = __float2half_rn(updated);
     }
 }
 
@@ -189,14 +204,26 @@ __global__ void bn_statistics(const float* partial, float* mean, float* variance
 }
 
 __global__ void bn_apply(const float* x, const float* weight, const float* bias, const float* mean,
-                         const float* variance, float* output, std::size_t count, int channels, float eps, bool relu) {
-    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * Threads + threadIdx.x;
-    if (index >= count) return;
-    const int channel = index % channels;
-    float value = (x[index] - mean[channel]) / sqrtf(variance[channel] + eps);
-    if (weight) value *= weight[channel];
-    if (bias) value += bias[channel];
-    output[index] = relu && value <= 0.0f ? 0.0f : value;
+                         const float* variance, float* output, int batch, int channels, float eps, bool relu) {
+    const int lane = threadIdx.x % Channels, group = threadIdx.x / Channels;
+    const int channel = blockIdx.x * Channels + lane;
+    __shared__ float averages[Channels], deviations[Channels], weights[Channels], biases[Channels];
+    if (group == 0 && channel < channels) {
+        averages[lane] = mean[channel];
+        deviations[lane] = sqrtf(variance[channel] + eps);
+        weights[lane] = weight ? weight[channel] : 1.0f;
+        biases[lane] = bias ? bias[channel] : 0.0f;
+    }
+    __syncthreads();
+    if (channel >= channels) return;
+    const int end = (blockIdx.y + 1) * ApplyRows < batch ? (blockIdx.y + 1) * ApplyRows : batch;
+    for (int row = blockIdx.y * ApplyRows + group; row < end; row += Groups) {
+        const std::size_t index = static_cast<std::size_t>(row) * channels + channel;
+        float value = (x[index] - averages[lane]) / deviations[lane];
+        if (weight) value *= weights[lane];
+        if (bias) value += biases[lane];
+        output[index] = relu && value <= 0.0f ? 0.0f : value;
+    }
 }
 
 __global__ void bn_gradient_partials(const float* x, const float* dy, const float* output, const float* mean,
@@ -231,31 +258,47 @@ __global__ void bn_gradient_partials(const float* x, const float* dy, const floa
     }
 }
 
-__global__ void bn_gradient_reduce(const float* partial, float* sums, float* dw, float* db,
-                                   int batch, int channels, int chunks) {
-    const int channel = blockIdx.x * Threads + threadIdx.x;
-    if (channel >= channels) return;
-    float sum = 0.0f, sum_x = 0.0f;
-    for (int chunk = 0; chunk < chunks; ++chunk) {
-        sum += partial[chunk * channels + channel];
-        sum_x += partial[(chunks + chunk) * channels + channel];
+// Reduce the existing chunk partials in their original order, then reuse the
+// per-channel statistics for a coalesced batch tile. Only tile zero writes the
+// affine adjoints, so the operation needs no atomics or separate reduce launch.
+__global__ void bn_backward_apply(const float* x, const float* dy, const float* output, const float* weight,
+                                  const float* mean, const float* variance, const float* partial, float* sums,
+                                  float* dx, float* dw, float* db, int batch, int channels, int chunks,
+                                  float eps, bool training, bool relu) {
+    const int lane = threadIdx.x % Channels, group = threadIdx.x / Channels;
+    const int channel = blockIdx.x * Channels + lane;
+    __shared__ float averages[Channels], inverses[Channels], weights[Channels];
+    __shared__ float gradient_means[Channels], normalized_means[Channels];
+    if (group == 0 && channel < channels) {
+        averages[lane] = mean[channel];
+        inverses[lane] = 1.0f / sqrtf(variance[channel] + eps);
+        weights[lane] = weight ? weight[channel] : 1.0f;
+        float sum = 0.0f, sum_x = 0.0f;
+        if (training || dw || db) {
+            for (int chunk = 0; chunk < chunks; ++chunk) {
+                sum += partial[chunk * channels + channel];
+                sum_x += partial[(chunks + chunk) * channels + channel];
+            }
+        }
+        gradient_means[lane] = sum / static_cast<float>(batch);
+        normalized_means[lane] = sum_x / static_cast<float>(batch);
+        if (blockIdx.y == 0) {
+            sums[channel] = gradient_means[lane];
+            sums[channels + channel] = normalized_means[lane];
+            if (dw) dw[channel] += sum_x;
+            if (db) db[channel] += sum;
+        }
     }
-    sums[channel] = sum / static_cast<float>(batch);
-    sums[channels + channel] = sum_x / static_cast<float>(batch);
-    if (dw) dw[channel] += sum_x;
-    if (db) db[channel] += sum;
-}
-
-__global__ void bn_dx(const float* x, const float* dy, const float* output, const float* weight,
-                      const float* mean, const float* variance, const float* sums, float* dx,
-                      std::size_t count, int channels, float eps, bool training, bool relu) {
-    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * Threads + threadIdx.x;
-    if (index >= count) return;
-    const int channel = index % channels;
-    const float inverse = 1.0f / sqrtf(variance[channel] + eps);
-    float gradient = relu && output[index] <= 0.0f ? 0.0f : dy[index];
-    if (training) gradient = gradient - sums[channel] - (x[index] - mean[channel]) * inverse * sums[channels + channel];
-    dx[index] += (weight ? weight[channel] : 1.0f) * inverse * gradient;
+    __syncthreads();
+    if (!dx || channel >= channels) return;
+    const int end = (blockIdx.y + 1) * ApplyRows < batch ? (blockIdx.y + 1) * ApplyRows : batch;
+    for (int row = blockIdx.y * ApplyRows + group; row < end; row += Groups) {
+        const std::size_t index = static_cast<std::size_t>(row) * channels + channel;
+        float gradient = relu && output[index] <= 0.0f ? 0.0f : dy[index];
+        if (training) gradient = gradient - gradient_means[lane]
+            - (x[index] - averages[lane]) * inverses[lane] * normalized_means[lane];
+        dx[index] += weights[lane] * inverses[lane] * gradient;
+    }
 }
 
 __global__ void rms_forward(const float* x, const float* weight, float* variance, float* output, int channels, float eps) {
@@ -334,8 +377,8 @@ bool dimensions(int batch, int channels, float eps) noexcept {
 }  // namespace flash_native
 }  // namespace
 
-extern "C" void* rl_flash_projection_create(std::size_t count, const void* const* first, const void* const* second,
-                                            const std::size_t* lengths, const int* kinds) noexcept {
+static void* create_flash_projection(std::size_t count, const void* const* first, const void* const* second,
+                                     const std::size_t* lengths, const int* kinds, const void* const* shadows) noexcept {
     last_error[0] = '\0';
     try {
         require(count && first && second && lengths && kinds, "Invalid projection metadata.");
@@ -344,12 +387,26 @@ extern "C" void* rl_flash_projection_create(std::size_t count, const void* const
         for (std::size_t i = 0; i < count; ++i) {
             require(first[i] && lengths[i] && kinds[i] >= 0 && kinds[i] <= 2 && (kinds[i] != 1 || second[i]),
                     "Invalid projection row/vector.");
+            require(!shadows || !shadows[i] || (kinds[i] == 0 && aligned(shadows[i], alignof(__half))),
+                    "Projection shadows require aligned FP16 unit-linear row destinations.");
             descriptors.push_back({static_cast<float*>(const_cast<void*>(first[i])),
-                                   static_cast<float*>(const_cast<void*>(second[i])), lengths[i], kinds[i]});
+                                   static_cast<float*>(const_cast<void*>(second[i])), lengths[i], kinds[i],
+                                   shadows ? static_cast<__half*>(const_cast<void*>(shadows[i])) : nullptr});
         }
         return flash_native::create_plan(descriptors).release();
     } catch (const Failure&) { return nullptr; }
     catch (...) { set_error("Unexpected host error creating projection plan."); return nullptr; }
+}
+
+extern "C" void* rl_flash_projection_create(std::size_t count, const void* const* first, const void* const* second,
+                                            const std::size_t* lengths, const int* kinds) noexcept {
+    return create_flash_projection(count, first, second, lengths, kinds, nullptr);
+}
+
+extern "C" void* rl_flash_projection_create_with_shadows(std::size_t count, const void* const* first,
+                                                         const void* const* second, const std::size_t* lengths,
+                                                         const int* kinds, const void* const* shadows) noexcept {
+    return create_flash_projection(count, first, second, lengths, kinds, shadows);
 }
 
 extern "C" int rl_flash_projection_step(void* opaque, void* stream) noexcept {
@@ -369,8 +426,8 @@ extern "C" int rl_flash_projection_destroy(void* opaque) noexcept {
     return result;
 }
 
-extern "C" void* rl_flash_ema_create(std::size_t count, const void* const* source, const void* const* target,
-                                     const std::size_t* lengths, float tau) noexcept {
+static void* create_flash_ema(std::size_t count, const void* const* source, const void* const* target,
+                              const std::size_t* lengths, float tau, const void* const* shadows) noexcept {
     last_error[0] = '\0';
     try {
         require(count && source && target && lengths && std::isfinite(tau) && tau >= 0.0f && tau <= 1.0f,
@@ -378,10 +435,13 @@ extern "C" void* rl_flash_ema_create(std::size_t count, const void* const* sourc
         std::vector<flash_native::Pair> descriptors;
         for (std::size_t i = 0; i < count; ++i) {
             require(source[i] && target[i] && lengths[i], "Invalid EMA tensor.");
+            require(!shadows || !shadows[i] || aligned(shadows[i], alignof(__half)),
+                    "EMA shadows require aligned FP16 destinations.");
             for (std::size_t offset = 0; offset < lengths[i]; offset += 1024) {
                 const std::size_t length = lengths[i] - offset < 1024 ? lengths[i] - offset : 1024;
                 descriptors.push_back({static_cast<const float*>(source[i]) + offset,
-                                       static_cast<float*>(const_cast<void*>(target[i])) + offset, length});
+                                       static_cast<float*>(const_cast<void*>(target[i])) + offset, length,
+                                       shadows && shadows[i] ? static_cast<__half*>(const_cast<void*>(shadows[i])) + offset : nullptr});
             }
         }
         auto plan = flash_native::create_plan(descriptors);
@@ -389,6 +449,17 @@ extern "C" void* rl_flash_ema_create(std::size_t count, const void* const* sourc
         return plan.release();
     } catch (const Failure&) { return nullptr; }
     catch (...) { set_error("Unexpected host error creating EMA plan."); return nullptr; }
+}
+
+extern "C" void* rl_flash_ema_create(std::size_t count, const void* const* source, const void* const* target,
+                                     const std::size_t* lengths, float tau) noexcept {
+    return create_flash_ema(count, source, target, lengths, tau, nullptr);
+}
+
+extern "C" void* rl_flash_ema_create_with_shadows(std::size_t count, const void* const* source,
+                                                  const void* const* target, const std::size_t* lengths,
+                                                  float tau, const void* const* shadows) noexcept {
+    return create_flash_ema(count, source, target, lengths, tau, shadows);
 }
 
 extern "C" int rl_flash_ema_step(void* opaque, void* stream) noexcept {
@@ -423,9 +494,9 @@ extern "C" int rl_flash_bn_forward(const float* x, const float* w, const float* 
         flash_native::bn_statistics<<<(channels + 255) / 256, 256, 0, st>>>(partial, mean, var, running_mean, running_var,
                                                                         batch, channels, chunks, momentum);
     }
-    const std::size_t count = static_cast<std::size_t>(batch) * channels;
-    flash_native::bn_apply<<<(count + 255) / 256, 256, 0, st>>>(x, w, b, training ? mean : running_mean,
-                                                             training ? var : running_var, y, count, channels, eps, relu != 0);
+    const dim3 apply_grid((channels + 31) / 32, (batch + flash_native::ApplyRows - 1) / flash_native::ApplyRows);
+    flash_native::bn_apply<<<apply_grid, 256, 0, st>>>(x, w, b, training ? mean : running_mean,
+                                                     training ? var : running_var, y, batch, channels, eps, relu != 0);
     return flash_native::launched("Run FlashSAC BatchNorm forward");
 }
 
@@ -441,12 +512,11 @@ extern "C" int rl_flash_bn_backward(const float* x, const float* dy, const float
     if (training || dw || db) {
         const dim3 grid((channels + 31) / 32, chunks);
         flash_native::bn_gradient_partials<<<grid, 256, 0, st>>>(x, dy, y, mean, var, partial, batch, channels, chunks, eps, relu != 0);
-        flash_native::bn_gradient_reduce<<<(channels + 255) / 256, 256, 0, st>>>(partial, sums, dw, db, batch, channels, chunks);
     }
-    if (dx) {
-        const std::size_t count = static_cast<std::size_t>(batch) * channels;
-        flash_native::bn_dx<<<(count + 255) / 256, 256, 0, st>>>(x, dy, y, w, mean, var, sums, dx, count, channels, eps,
-                                                              training != 0, relu != 0);
+    if (dx || dw || db) {
+        const dim3 grid((channels + 31) / 32, dx ? (batch + flash_native::ApplyRows - 1) / flash_native::ApplyRows : 1);
+        flash_native::bn_backward_apply<<<grid, 256, 0, st>>>(x, dy, y, w, mean, var, partial, sums, dx, dw, db,
+                                                            batch, channels, chunks, eps, training != 0, relu != 0);
     }
     return flash_native::launched("Run FlashSAC BatchNorm backward");
 }

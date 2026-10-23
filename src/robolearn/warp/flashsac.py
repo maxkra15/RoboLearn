@@ -482,11 +482,18 @@ class WarpFlashSAC:
         self._ema_parameters = [(source[name].data.flatten(), target[name].data.flatten()) for name in source]
         self._fused_ema = None
         if fused_updates:
+            from robolearn.cuda import CudaLinear
             from robolearn.cuda.flash import CudaEMA
 
+            target_shadows = {
+                module.weight.data.ptr: module.weight_shadow.flatten()
+                for module in self.target_critic._all_modules()
+                if isinstance(module, CudaLinear) and module.weight_shadow is not None
+            }
             self._fused_ema = CudaEMA(
                 sources=[pair[0] for pair in self._ema_parameters],
                 targets=[pair[1] for pair in self._ema_parameters],
+                target_shadows=[target_shadows.get(pair[1].ptr) for pair in self._ema_parameters],
                 tau=cfg.critic_target_update_tau,
             ).prepare()
         self.metrics = {
@@ -724,24 +731,25 @@ class WarpFlashSAC:
         )
         target_q, target_lp = self.target_critic(self._critic_observations, self._critic_actions, training=True)
         self.maximum_entropy_bonus.fill_(-1.0e30)
-        wp.launch(
-            _categorical_target,
-            dim=self.batch_size,
-            inputs=[
-                target_q,
-                target_lp,
-                reward,
-                self.batch["terminated"],
-                self.batch["discount"],
-                self._next_log_probs,
-                self.alpha,
-                self.cfg.critic_min_v,
-                self.cfg.critic_max_v,
-                self.target_probabilities,
-                self.maximum_entropy_bonus,
-            ],
-            device=self.device,
-        )
+        target_inputs = [
+            target_q,
+            target_lp,
+            reward,
+            self.batch["terminated"],
+            self.batch["discount"],
+            self._next_log_probs,
+            self.alpha,
+            self.cfg.critic_min_v,
+            self.cfg.critic_max_v,
+            self.target_probabilities,
+            self.maximum_entropy_bonus,
+        ]
+        if self.fused_updates and self.cfg.critic_num_bins <= 4096:
+            from robolearn.cuda.categorical import categorical_target
+
+            categorical_target(*target_inputs)
+        else:
+            wp.launch(_categorical_target, dim=self.batch_size, inputs=target_inputs, device=self.device)
         self.critic_loss.zero_()
         with wp.Tape() as tape:
             _, log_probs = self.critic(self._critic_observations, self._critic_actions, training=True)
@@ -1005,6 +1013,8 @@ class WarpFlashSAC:
                 raise ValueError(f"Checkpoint array {key} is missing or has the wrong shape.")
         for key, array in arrays.items():
             self._assign(array, state[key], key)
+        for network in (self.actor, self.critic, self.target_critic):
+            network.refresh_weight_shadows()
         replay_state = {key.removeprefix("replay."): value for key, value in state.items() if key.startswith("replay.")}
         self.replay.load_state_dict(replay_state, restore_storage=bool(state["replay_storage_included"][0]))
         if self.reward_normalizer is not None:

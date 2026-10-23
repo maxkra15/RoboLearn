@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Optimized experimental native FlashSAC with projection/EMA-managed FP16 weight
+  copies, vectorized conversions, tiled batch normalization, and cooperative
+  categorical heads and target projection.
+
 - Added opt-in FP16 dense compute with FP32 master weights and Adam, dynamic
   loss scaling, and fused normalization/ReLU, parameter projections and target
   EMA for the experimental native FlashSAC backend.

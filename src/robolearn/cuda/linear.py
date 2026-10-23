@@ -39,6 +39,9 @@ class CudaLinear(nn.Linear):
         self.workspace_limit = workspace_limit
         self.compute_dtype = compute_dtype
         self._cuda_plans = {}
+        self._weight_shadow = None
+        self._shadow_library = None
+        self._weight_shadow_managed = False
 
     @property
     def compute_dtype(self):
@@ -49,6 +52,73 @@ class CudaLinear(nn.Linear):
         if value not in ("float32", "float16"):
             raise ValueError("compute_dtype must be 'float32' or 'float16'")
         self._compute_dtype = value
+
+    @property
+    def weight_shadow(self):
+        """Return the prepared FP16 weight buffer, or ``None`` before preparation.
+
+        This is derived storage, not a parameter or checkpoint entry. A caller
+        managing its refresh must retain this buffer while graphs use it.
+        """
+        return self._weight_shadow
+
+    def prepare_weight_shadow(self):
+        """Allocate and initialize one FP16 weight shadow outside graph capture.
+
+        All batch shapes share this address. Parameters must remain unchanged
+        between a forward and its backward, including calls of other shapes.
+        """
+        if self._weight_shadow is not None:
+            return self._weight_shadow
+        if self.device.is_capturing:
+            raise RuntimeError("Prepare the FP16 weight shadow before capture")
+        with wp.ScopedDevice(self.device):
+            library = library_for(self.device)
+            shadow = wp.empty(self.weight.data.shape, dtype=wp.float16, device=self.device)
+            check(
+                library,
+                library.rl_cast_f32_f16(
+                    pointer(self.weight.data), pointer(shadow), self.weight.data.size, stream_pointer(self.device)
+                ),
+                "Initialize FP16 weight shadow",
+            )
+        self._weight_shadow = shadow
+        self._shadow_library = library
+        return shadow
+
+    def set_weight_shadow_managed(self, enabled: bool = True):
+        """Let a caller refresh the FP16 shadow after every master-weight mutation.
+
+        The default recasts weights at every FP16 forward. Managed mode omits
+        that launch, allowing a projection or EMA kernel to write the shadow
+        together with its FP32 master. The caller must also refresh after any
+        initialization, checkpoint load, or warmup-state restore. Changing the
+        mode affects subsequently captured operations, not existing graphs.
+        """
+        if self.device.is_capturing:
+            raise RuntimeError("Configure FP16 weight-shadow ownership before capture")
+        if enabled:
+            self.prepare_weight_shadow()
+        self._weight_shadow_managed = bool(enabled)
+        return self
+
+    def refresh_weight_shadow(self):
+        """Enqueue a shadow refresh; capture-safe after shadow preparation."""
+        if self._weight_shadow is None:
+            self.prepare_weight_shadow()
+            return self
+        with wp.ScopedDevice(self.device):
+            check(
+                self._shadow_library,
+                self._shadow_library.rl_cast_f32_f16(
+                    pointer(self.weight.data),
+                    pointer(self._weight_shadow),
+                    self.weight.data.size,
+                    stream_pointer(self.device),
+                ),
+                "Refresh FP16 weight shadow",
+            )
+        return self
 
     @contextmanager
     def precision(self, compute_dtype: str):
@@ -106,7 +176,7 @@ class CudaLinear(nn.Linear):
                     self._cache[key] = wp.empty(key[0], dtype=wp.float32, device=self.device, requires_grad=True)
                 converted = (
                     (
-                        wp.empty((outgoing, incoming), dtype=wp.float16, device=self.device),
+                        self.prepare_weight_shadow(),
                         wp.empty((batch_size, incoming), dtype=wp.float16, device=self.device),
                         wp.empty((batch_size, outgoing), dtype=wp.float16, device=self.device),
                     )
@@ -174,7 +244,8 @@ class CudaLinear(nn.Linear):
                 forward_weight, forward_input = weight, input
             else:
                 forward_weight, forward_input, _ = converted
-                cast(weight, forward_weight)
+                if not self._weight_shadow_managed:
+                    cast(weight, forward_weight)
                 cast(input, forward_input)
             run(forward, forward_weight, forward_input, output, 0.0, bias)
         if tape is None:
@@ -213,10 +284,14 @@ class CudaLinear(nn.Linear):
 
     def close(self):
         """Release plans after all dependent graphs and device work have finished."""
+        if self.device.is_capturing:
+            raise RuntimeError("Cannot close CudaLinear during capture")
         for plans, _, _, _ in self._cuda_plans.values():
             for plan in plans:
                 plan.close()
         self._cuda_plans.clear()
+        self._weight_shadow = None
+        self._shadow_library = None
 
     def to(self, device):
         device = wp.get_device(device)

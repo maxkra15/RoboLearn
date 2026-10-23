@@ -242,6 +242,7 @@ def _load_author_arrays(module: nn.Module, mapping: Mapping[str, np.ndarray]) ->
         if value.shape != array.shape:
             raise ValueError(f"Checkpoint {name!r} has shape {value.shape}, expected {array.shape}.")
         wp.copy(array, wp.array(np.ascontiguousarray(value), dtype=wp.float32, device=array.device))
+    module.refresh_weight_shadows()
 
 
 class _FlashNetwork(nn.Module):
@@ -252,19 +253,27 @@ class _FlashNetwork(nn.Module):
     def normalize_parameters(self) -> None:
         """Apply the authors' projections after an Adam update, outside its tape."""
         if getattr(self, "fused_updates", False):
+            from robolearn.cuda import CudaLinear
             from robolearn.cuda.flash import CudaProjection
             from robolearn.cuda.normalization import CudaBatchNorm, CudaRMSNorm
 
             if not hasattr(self, "_projection"):
-                rows, affines, scales = [], [], []
+                rows, shadows, affines, scales = [], [], [], []
                 for module in self._all_modules():
                     if isinstance(module, _UnitLinear):
                         rows.append(module.w.weight.data)
+                        shadow = None
+                        if isinstance(module.w, CudaLinear) and module.w.compute_dtype == "float16":
+                            shadow = module.w.prepare_weight_shadow()
+                            module.w.set_weight_shadow_managed(True)
+                        shadows.append(shadow)
                     elif isinstance(module, CudaBatchNorm):
                         affines.append((module.weight.data, module.bias.data))
                     elif isinstance(module, CudaRMSNorm):
                         scales.append(module.weight.data)
-                self._projection = CudaProjection(rows=rows, affines=affines, scales=scales).prepare()
+                self._projection = CudaProjection(
+                    rows=rows, row_shadows=shadows, affines=affines, scales=scales
+                ).prepare()
             self._projection.step()
             return
         pending = list(self.modules())
@@ -273,6 +282,21 @@ class _FlashNetwork(nn.Module):
             if isinstance(module, (_UnitLinear, _UnitBatchNorm, _UnitRMSNorm)):
                 module.normalize_parameters()
             pending.extend(module.modules())
+
+    def refresh_weight_shadows(self) -> None:
+        """Refresh derived native operands after direct master-array restoration."""
+        if not getattr(self, "fused_updates", False):
+            return
+        from robolearn.cuda import CudaLinear
+
+        for module in self._all_modules():
+            if isinstance(module, CudaLinear) and module.weight_shadow is not None:
+                module.refresh_weight_shadow()
+
+    def load_state_dict(self, state_dict: dict[str, wp.array]) -> None:
+        """Load owned arrays, then refresh derived FP16 operands in place."""
+        super().load_state_dict(state_dict)
+        self.refresh_weight_shadows()
 
     def _all_modules(self):
         pending, seen = list(self.modules()), set()
@@ -412,15 +436,23 @@ class FlashActor(_Backbone):
 
 
 class _ValueHead(nn.Module):
-    def __init__(self, hidden_dim, num_bins, min_v, max_v, rng, linear, requires_grad):
+    def __init__(self, hidden_dim, num_bins, min_v, max_v, rng, linear, requires_grad, fused=False):
         super().__init__(requires_grad=requires_grad)
         self.w = _UnitLinear(hidden_dim, num_bins, rng, linear, requires_grad)
         self.bias = nn.Parameter(wp.zeros(num_bins, device=self.device), requires_grad=requires_grad)
         self.bin_values = nn.Buffer(wp.array(np.linspace(min_v, max_v, num_bins, dtype=np.float32), device=self.device))
-        self.log_softmax = LogSoftmax(dim=-1, requires_grad=requires_grad)
+        self.fused = fused
+        if fused:
+            from robolearn.cuda.categorical import CudaCategorical
+
+            self.categorical = CudaCategorical(requires_grad=requires_grad)
+        else:
+            self.log_softmax = LogSoftmax(dim=-1, requires_grad=requires_grad)
         super().__post_init__()
 
     def __call__(self, input: wp.array) -> tuple[wp.array, wp.array]:
+        if self.fused:
+            return self.categorical(self.w(input), self.bias.data, self.bin_values.data)
         shape = (input.shape[0], self.bias.shape[0])
         if shape not in self._cache:
             self._cache[shape] = (
@@ -448,7 +480,7 @@ class _ValueNetwork(_Backbone):
     ):
         super().__init__(input_dim, hidden_dim, num_blocks, rng, linear, requires_grad, fused)
         self.predictor = self.register_module(
-            "predictor", _ValueHead(hidden_dim, num_bins, min_v, max_v, rng, linear, requires_grad)
+            "predictor", _ValueHead(hidden_dim, num_bins, min_v, max_v, rng, linear, requires_grad, fused)
         )
 
     def __call__(self, input: wp.array) -> tuple[wp.array, wp.array]:

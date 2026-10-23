@@ -19,9 +19,11 @@ def _library(device):
     tables, sizes = ctypes.POINTER(p), ctypes.POINTER(n)
     signatures = {
         "projection_create": ([n, tables, tables, sizes, ctypes.POINTER(i)], p),
+        "projection_create_with_shadows": ([n, tables, tables, sizes, ctypes.POINTER(i), tables], p),
         "projection_step": ([p, p], i),
         "projection_destroy": ([p], i),
         "ema_create": ([n, tables, tables, sizes, f], p),
+        "ema_create_with_shadows": ([n, tables, tables, sizes, f, tables], p),
         "ema_step": ([p, p], i),
         "ema_destroy": ([p], i),
         "bn_forward": ([p] * 9 + [i, i, f, f, i, i, p], i),
@@ -40,6 +42,21 @@ def _validate(arrays, device):
     for array in arrays:
         if array.dtype != wp.float32 or array.device != device or not array.is_contiguous:
             raise ValueError("Native FlashSAC operations require contiguous FP32 arrays on one CUDA device")
+
+
+def _validate_shadows(arrays, shadows, device):
+    shadows = [None] * len(arrays) if shadows is None else list(shadows)
+    if len(shadows) != len(arrays):
+        raise ValueError("FP16 shadow sequences must match their FP32 parameter sequences")
+    for array, shadow in zip(arrays, shadows, strict=True):
+        if shadow is not None and (
+            shadow.dtype != wp.float16
+            or shadow.device != device
+            or not shadow.is_contiguous
+            or shadow.shape != array.shape
+        ):
+            raise ValueError("Shadows must be contiguous FP16 arrays matching the FP32 shape and CUDA device")
+    return shadows
 
 
 class _Plan:
@@ -101,11 +118,15 @@ class CudaProjection(_Plan):
     ``sqrt(C) / sqrt(sum(w*w + b*b) + 1e-8)`` factor; RMS scales use the same
     factor without a bias. Cooperative reductions change FP32 summation order.
     Call after every scheduled optimizer attempt, including skipped AMP steps.
+
+    Optional ``row_shadows`` mirror the supplied matrices in FP16. The same
+    kernel rounds each final FP32 projected weight into its persistent shadow.
+    The caller remains responsible for refreshing shadows after direct loads.
     """
 
     _kind = "projection"
 
-    def __init__(self, *, rows=(), affines=(), scales=()):
+    def __init__(self, *, rows=(), affines=(), scales=(), row_shadows=None):
         self.rows, self.affines, self.scales = list(rows), list(affines), list(scales)
         arrays = self.rows + [array for pair in self.affines for array in pair] + self.scales
         super().__init__(arrays)
@@ -115,6 +136,7 @@ class CudaProjection(_Plan):
             raise ValueError("BN affine projections require matching nonempty vectors")
         if any(array.ndim != 1 or array.size == 0 for array in self.scales):
             raise ValueError("RMS scale projections require nonempty vectors")
+        self.row_shadows = _validate_shadows(self.rows, row_shadows, self.device)
 
     def prepare(self):
         """Copy immutable row/vector pointer descriptors outside capture."""
@@ -123,12 +145,18 @@ class CudaProjection(_Plan):
         if self.device.is_capturing:
             raise RuntimeError("Prepare CudaProjection before graph capture")
         descriptors = [
-            (array.ptr + row * array.shape[1] * 4, 0, array.shape[1], 0)
-            for array in self.rows
+            (
+                array.ptr + row * array.shape[1] * 4,
+                0,
+                array.shape[1],
+                0,
+                shadow.ptr + row * array.shape[1] * 2 if shadow is not None else 0,
+            )
+            for array, shadow in zip(self.rows, self.row_shadows, strict=True)
             for row in range(array.shape[0])
         ]
-        descriptors += [(a.ptr, b.ptr, a.size, 1) for a, b in self.affines]
-        descriptors += [(array.ptr, 0, array.size, 2) for array in self.scales]
+        descriptors += [(a.ptr, b.ptr, a.size, 1, 0) for a, b in self.affines]
+        descriptors += [(array.ptr, 0, array.size, 2, 0) for array in self.scales]
         count = len(descriptors)
         columns = list(zip(*descriptors, strict=True))
         first = (ctypes.c_void_p * count)(*columns[0])
@@ -137,7 +165,13 @@ class CudaProjection(_Plan):
         kinds = (ctypes.c_int * count)(*columns[3])
         with wp.ScopedDevice(self.device):
             self._library = _library(self.device)
-            self._created(self._library.rl_flash_projection_create(count, first, second, lengths, kinds))
+            if any(shadow is not None for shadow in self.row_shadows):
+                shadows = (ctypes.c_void_p * count)(*columns[4])
+                self._created(
+                    self._library.rl_flash_projection_create_with_shadows(count, first, second, lengths, kinds, shadows)
+                )
+            else:
+                self._created(self._library.rl_flash_projection_create(count, first, second, lengths, kinds))
         return self
 
 
@@ -146,11 +180,13 @@ class CudaEMA(_Plan):
 
     Supply parameter arrays only when matching FlashSAC target updates; running
     normalization statistics remain governed by the network forward operation.
+    Optional ``target_shadows`` receive the FP16 rounding of each final target
+    parameter in the same launch. Direct target loads still require a refresh.
     """
 
     _kind = "ema"
 
-    def __init__(self, sources, targets, tau):
+    def __init__(self, sources, targets, tau, *, target_shadows=None):
         self.sources, self.targets = list(sources), list(targets)
         self.tau = float(tau)
         if not self.sources or len(self.sources) != len(self.targets):
@@ -160,6 +196,7 @@ class CudaEMA(_Plan):
         if any(a.shape != b.shape or a.size == 0 for a, b in zip(self.sources, self.targets, strict=True)):
             raise ValueError("EMA source and target shapes must match")
         super().__init__(self.sources + self.targets)
+        self.target_shadows = _validate_shadows(self.targets, target_shadows, self.device)
 
     def prepare(self):
         """Copy immutable tensor pointers and block descriptors outside capture."""
@@ -173,5 +210,13 @@ class CudaEMA(_Plan):
         lengths = (ctypes.c_size_t * count)(*(array.size for array in self.sources))
         with wp.ScopedDevice(self.device):
             self._library = _library(self.device)
-            self._created(self._library.rl_flash_ema_create(count, sources, targets, lengths, self.tau))
+            if any(shadow is not None for shadow in self.target_shadows):
+                shadows = (ctypes.c_void_p * count)(
+                    *(array.ptr if array is not None else 0 for array in self.target_shadows)
+                )
+                self._created(
+                    self._library.rl_flash_ema_create_with_shadows(count, sources, targets, lengths, self.tau, shadows)
+                )
+            else:
+                self._created(self._library.rl_flash_ema_create(count, sources, targets, lengths, self.tau))
         return self

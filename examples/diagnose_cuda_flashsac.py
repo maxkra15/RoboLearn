@@ -165,6 +165,21 @@ def dense(report, rng):
     finally:
         for parameter, gradient in zip(layer.parameters(), gradients, strict=True):
             parameter.grad = gradient
+    shadow = layer.prepare_weight_shadow()
+    layer.prepare(9)
+    report.check("shared_shadow_across_shapes", shadow.ptr == layer.weight_shadow.ptr)
+    layer.set_weight_shadow_managed(True)
+    updated_weight = w + np.float32(0.03125)
+    layer.weight.data.assign(updated_weight)
+    layer.refresh_weight_shadow()
+    expected_output = x16 @ updated_weight.astype(np.float16).astype(np.float64).T + b
+    report.arrays("managed_shadow/updated_forward", layer(source).numpy(), expected_output)
+    with wp.ScopedCapture() as refreshed:
+        layer.refresh_weight_shadow()
+        refreshed_output = layer(source)
+    wp.capture_launch(refreshed.graph)
+    report.arrays("managed_shadow/capture", refreshed_output.numpy(), expected_output)
+    report.arrays("managed_shadow/rounding", shadow.numpy(), updated_weight.astype(np.float16), exact=True)
     np.savez(
         report.artifacts / "dense.npz",
         **{f"eager_{k}": v for k, v in eager.items()},
@@ -272,10 +287,15 @@ def projection_ema(report, rng):
         "target": rng.normal(size=(3, 7)).astype(np.float32),
     }
     arrays = {name: wp.array(value) for name, value in values.items()}
+    row_shadow = wp.empty(arrays["rows"].shape, dtype=wp.float16)
+    target_shadow = wp.empty(arrays["target"].shape, dtype=wp.float16)
     projection = CudaProjection(
-        rows=[arrays["rows"]], affines=[(arrays["weight"], arrays["bias"])], scales=[arrays["scale"]]
+        rows=[arrays["rows"]],
+        row_shadows=[row_shadow],
+        affines=[(arrays["weight"], arrays["bias"])],
+        scales=[arrays["scale"]],
     ).prepare()
-    ema = CudaEMA([arrays["rows"]], [arrays["target"]], 0.125).prepare()
+    ema = CudaEMA([arrays["rows"]], [arrays["target"]], 0.125, target_shadows=[target_shadow]).prepare()
 
     def run():
         projection.step()
@@ -298,6 +318,8 @@ def projection_ema(report, rng):
     for name in arrays:
         report.arrays(f"formula/{name}", eager[name], reference[name], atol=2e-6, rtol=2e-6)
         report.arrays(f"capture/{name}", captured[name], eager[name], exact=True)
+    report.arrays("projection_shadow", row_shadow.numpy(), captured["rows"].astype(np.float16), exact=True)
+    report.arrays("ema_shadow", target_shadow.numpy(), captured["target"].astype(np.float16), exact=True)
     np.savez(report.artifacts / "projection-ema.npz", **eager)
 
 
@@ -386,6 +408,128 @@ def normalization(report, rng):
                 for parameter, gradient in zip(module.parameters(), gradients, strict=True):
                     parameter.grad = gradient
         np.savez(report.artifacts / f"normalization-{label}.npz", **eager)
+
+
+def categorical(report, rng, bins=101):
+    from robolearn.cuda.categorical import CudaCategorical, categorical_target
+    from robolearn.warp.flashsac import _categorical_target
+
+    # Irregular dimensions exercise padding and cooperative row reductions.
+    batch = 17
+    raw = rng.normal(0, 0.4, (batch, bins)).astype(np.float32)
+    bias = rng.normal(0, 0.1, bins).astype(np.float32)
+    support = np.linspace(-5, 5, bins, dtype=np.float32)
+    dlp = rng.normal(0, 0.2, raw.shape).astype(np.float32)
+    dq = rng.normal(0, 0.2, batch).astype(np.float32)
+    x, b, z = wp.array(raw, requires_grad=True), wp.array(bias, requires_grad=True), wp.array(support)
+    seeds = wp.array(dlp), wp.array(dq)
+    module = CudaCategorical()
+    tx, tb = (
+        torch.tensor(raw, dtype=torch.float64, requires_grad=True),
+        torch.tensor(bias, dtype=torch.float64, requires_grad=True),
+    )
+    tlp = torch.log_softmax(tx + tb, dim=-1)
+    tq = (tlp.exp() * torch.tensor(support, dtype=torch.float64)).sum(-1)
+    (tlp * torch.tensor(dlp, dtype=torch.float64)).sum().add(
+        (tq * torch.tensor(dq, dtype=torch.float64)).sum()
+    ).backward()
+    reference = {
+        "log_probs": tlp.detach().numpy(),
+        "values": tq.detach().numpy(),
+        "dx": tx.grad.numpy(),
+        "db": tb.grad.numpy(),
+    }
+
+    def run():
+        x.grad.zero_()
+        if b.grad is not None:
+            b.grad.zero_()
+        with wp.Tape() as tape:
+            values, lp = module(x, b, z)
+        wp.copy(lp.grad, seeds[0])
+        wp.copy(values.grad, seeds[1])
+        tape.backward()
+        return values, lp
+
+    def state(outputs):
+        values, lp = outputs
+        return {
+            "log_probs": lp.numpy().copy(),
+            "values": values.numpy().copy(),
+            "dx": x.grad.numpy().copy(),
+            "db": b.grad.numpy().copy(),
+        }
+
+    eager = state(run())
+    with wp.ScopedCapture() as capture:
+        outputs = run()
+    wp.capture_launch(capture.graph)
+    captured = state(outputs)
+    for name in reference:
+        report.arrays(f"head/torch/{name}", eager[name], reference[name], atol=3e-5, rtol=3e-5)
+        report.arrays(f"head/capture/{name}", captured[name], eager[name], exact=True)
+    gradient = b.grad
+    try:
+        b.grad = None
+        run()
+        report.arrays("head/frozen_bias_dx", x.grad.numpy(), reference["dx"], atol=3e-5, rtol=3e-5)
+    finally:
+        b.grad = gradient
+
+    # Match the existing target including ties, boundary clamps and terminations.
+    target_logits = rng.normal(size=(2, 2 * batch, bins)).astype(np.float32)
+    target_lp = torch.log_softmax(torch.tensor(target_logits, dtype=torch.float64), -1).numpy().astype(np.float32)
+    q = (np.exp(target_lp) * support).sum(-1).astype(np.float32)
+    q[:, batch + 1] = 0.0
+    reward = rng.uniform(-8, 8, batch).astype(np.float32)
+    terminated = (np.arange(batch) % 4 == 0).astype(np.float32)
+    discount = rng.uniform(0, 1, batch).astype(np.float32)
+    next_lp = rng.normal(size=batch).astype(np.float32)
+    reward[1], terminated[1], discount[1], next_lp[1] = 0.0, 0.0, 0.9, 0.0
+    args = [
+        wp.array(value) for value in (q, target_lp, reward, terminated, discount, next_lp, np.array([0.1], np.float32))
+    ]
+    target, maximum = wp.empty((batch, bins)), wp.empty(1)
+    ref_target, ref_maximum = wp.empty_like(target), wp.empty_like(maximum)
+    ref_maximum.fill_(-1e30)
+    wp.launch(
+        _categorical_target,
+        dim=batch,
+        inputs=[*args, -5.0, 5.0, ref_target, ref_maximum],
+    )
+
+    def project():
+        maximum.fill_(-1e30)
+        categorical_target(*args, -5.0, 5.0, target, maximum)
+
+    project()
+    projected = target.numpy().copy()
+    report.arrays("target/warp_reference", projected, ref_target.numpy(), atol=3e-6, rtol=3e-6)
+    report.arrays("target/maximum_entropy", maximum.numpy(), ref_maximum.numpy(), exact=True)
+    report.arrays("target/probability_mass", projected.sum(-1), np.ones(batch), atol=3e-6, rtol=3e-6)
+    with wp.ScopedCapture() as capture:
+        project()
+    wp.capture_launch(capture.graph)
+    report.arrays("target/capture", target.numpy(), projected, atol=3e-6, rtol=3e-6)
+    np.savez(
+        report.artifacts / f"categorical-{bins}.npz",
+        **eager,
+        **{f"torch_{name}": value for name, value in reference.items()},
+        raw=raw,
+        bias=bias,
+        support=support,
+        dlog_probs=dlp,
+        dvalues=dq,
+        target=projected,
+        reference_target=ref_target.numpy(),
+        target_q=q,
+        target_log_probs=target_lp,
+        reward=reward,
+        terminated=terminated,
+        discount=discount,
+        next_log_probs=next_lp,
+        alpha=np.array([0.1], np.float32),
+    )
 
 
 def learner_controls(report, label, agent, scheduled):
@@ -585,6 +729,8 @@ def main():
                 ("scaler", scaler),
                 ("projection-ema", projection_ema),
                 ("normalization", normalization),
+                ("categorical", categorical),
+                ("categorical-wide", lambda report, rng: categorical(report, rng, bins=257)),
             ):
                 with report.stage(name):
                     function(report, rng)

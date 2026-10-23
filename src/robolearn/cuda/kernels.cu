@@ -245,6 +245,18 @@ __global__ void cast_float_to_half(const float* source, __half* destination, std
     if (i < count) destination[i] = __float2half_rn(source[i]);
 }
 
+__global__ void cast_float_to_half4(const float* source, __half* destination, std::size_t count) {
+    const std::size_t offset = (static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
+    if (offset + 3 < count) {
+        const float4 values = *reinterpret_cast<const float4*>(source + offset);
+        auto* pairs = reinterpret_cast<__half2*>(destination + offset);
+        pairs[0] = __floats2half2_rn(values.x, values.y);
+        pairs[1] = __floats2half2_rn(values.z, values.w);
+    } else {
+        for (std::size_t i = offset; i < count; ++i) destination[i] = __float2half_rn(source[i]);
+    }
+}
+
 __global__ void scaler_reset(int* found_inf) { found_inf[0] = 0; }
 
 __global__ void adam_unscale(
@@ -406,9 +418,16 @@ extern "C" int rl_cast_f32_f16(const void* source, void* destination, std::size_
         set_error("FP16 conversion requires nonempty aligned buffers within CUDA grid limits.");
         return -1;
     }
-    cast_float_to_half<<<static_cast<unsigned>((count - 1) / kThreads + 1), kThreads, 0,
-        reinterpret_cast<cudaStream_t>(stream)>>>(static_cast<const float*>(source),
-        static_cast<__half*>(destination), count);
+    if (aligned(source, alignof(float4)) && aligned(destination, alignof(__half2))) {
+        const std::size_t vectors = (count - 1) / 4 + 1;
+        cast_float_to_half4<<<static_cast<unsigned>((vectors - 1) / kThreads + 1), kThreads, 0,
+            reinterpret_cast<cudaStream_t>(stream)>>>(static_cast<const float*>(source),
+            static_cast<__half*>(destination), count);
+    } else {
+        cast_float_to_half<<<static_cast<unsigned>((count - 1) / kThreads + 1), kThreads, 0,
+            reinterpret_cast<cudaStream_t>(stream)>>>(static_cast<const float*>(source),
+            static_cast<__half*>(destination), count);
+    }
     const cudaError_t status = cudaPeekAtLastError();
     if (status != cudaSuccess) {
         set_error("Convert FP32 to FP16: %s", cudaGetErrorString(status));
@@ -646,3 +665,4 @@ extern "C" int rl_adam_destroy(void* opaque) noexcept {
 }
 
 #include "flash_kernels.cuh"
+#include "categorical_kernels.cuh"
