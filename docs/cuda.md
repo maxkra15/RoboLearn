@@ -336,7 +336,10 @@ Untimed profiles recorded 4,848 kernel events across eight native FP32 calls,
 versus 2,584 with fusion. The fused mixed-precision path recorded 3,416 events,
 including 820 FP32-to-FP16 casts. Reducing those conversions is a further tuning
 opportunity; event counts do not establish runtime shares or predict a speedup.
-Profiling restored learner state exactly and is excluded from the timing table.
+Counts select the profiler's kernel category, excluding separately classified
+memset/copy events. Category assignments differ across variants, so these are
+not conserved counts of all GPU or algorithm operations. Profiling restored
+learner state exactly and is excluded from the timing table.
 
 All nine focused diagnostic stages passed: dense and normalization formulas,
 projection/EMA, dynamic-scaler overflow handling, eager/captured updates, exact
