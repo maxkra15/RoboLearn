@@ -21,6 +21,47 @@ enable TF32 or mixed precision silently. `CudaLinear(allow_tf32=True)` is an
 explicit low-level experiment, outside the default learner recipes. Different
 floating-point reduction orders can still change updates and learning outcomes.
 
+### Native FlashSAC mixed precision and fusion
+
+FlashSAC can opt into FP16 dense operands with FP32 accumulation, outputs,
+activations, master parameters, gradients and Adam moments. Actor and critic
+optimizers use independent device-side dynamic loss scales. Nonfinite gradient
+attempts skip parameter, moment and completed-step updates; attempt/skip counters
+and scales are checkpointed. Temperature learning and environment action
+inference remain FP32. The scheduler, parameter projections and target EMA follow
+the authors' attempted-update cadence, including overflow skips.
+
+```python
+agent = WarpFlashSAC(
+    123,
+    37,
+    num_envs=1024,
+    cfg=FlashSACConfig(device="cuda:0", use_amp=True, use_compile=False),
+    dense_backend="cuda",
+    fused_updates=True,
+)
+agent.prepare(capture=True)
+```
+
+`fused_updates=True` selects cooperative native normalization with fused ReLU in
+residual blocks, one whole-network parameter-projection launch, and one
+multi-tensor target EMA launch. Losses and the actor/temperature/critic update
+order are preserved. Reduction order and mixed-precision rounding differ from
+Torch autocast. Batch-statistic and optimizer dependencies retain multiple
+ordered kernels inside each captured update graph.
+
+The options are independent: leave `use_amp=False` for a fusion-only experiment,
+or `fused_updates=False` to measure mixed precision with the original Warp
+normalization. The default remains FP32 with fusion disabled. Restore the same
+precision to resume optimizer/scaler state; use `load_optimizer=False` when
+transferring a policy checkpoint to a different precision recipe.
+
+Standalone diagnostics exercise rounded-input GEMM references, overflow skips,
+capture, normalization gradients and checkpoint continuation. Synthetic update
+benchmarks support `--compile-fp32`, `--native-variants fp32 fp32-fused amp amp-fused`
+and `--profile-native`; profiler work is outside measured update time and restores
+the learner afterward. Performance and task-learning quality require measurements.
+
 This is a short sequence of GPU kernels captured as a graph. FlashSAC's batch
 normalization, parameter-gradient reductions and optimizer dependencies limit
 whole-network fusion. Its existing residual blocks and categorical critics are

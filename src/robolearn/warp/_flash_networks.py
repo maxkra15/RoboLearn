@@ -12,6 +12,7 @@ module outputs: consume them before another call with the same batch shape.
 
 from collections.abc import Mapping
 from contextlib import contextmanager
+from functools import partial
 
 import numpy as np
 import warp as wp
@@ -21,14 +22,30 @@ from ._flash_normalization import BatchNorm, LogSoftmax, RMSNorm
 from ._linear import TiledLinear
 
 
-def _linear_type(dense_backend: str, optimized_linear_backward: bool):
+def _linear_type(dense_backend: str, optimized_linear_backward: bool, compute_dtype: str = "float32"):
     if dense_backend == "cuda":
         from robolearn.cuda import CudaLinear
 
-        return CudaLinear
+        return partial(CudaLinear, compute_dtype=compute_dtype)
     if dense_backend != "warp":
         raise ValueError("dense_backend must be 'warp' or 'cuda'.")
     return TiledLinear if optimized_linear_backward else nn.Linear
+
+
+def _batch_norm(dimension, requires_grad, fused, *, relu=False):
+    if fused:
+        from robolearn.cuda.normalization import CudaBatchNorm
+
+        return CudaBatchNorm(dimension, eps=1.0e-5, momentum=0.01, requires_grad=requires_grad, relu=relu)
+    return _UnitBatchNorm(dimension, requires_grad)
+
+
+def _rms_norm(dimension, requires_grad, fused):
+    if fused:
+        from robolearn.cuda.normalization import CudaRMSNorm
+
+        return CudaRMSNorm(dimension, eps=1.0e-6, requires_grad=requires_grad)
+    return _UnitRMSNorm(dimension, requires_grad)
 
 
 @wp.kernel(enable_backward=False)
@@ -176,9 +193,9 @@ class _UnitRMSNorm(RMSNorm):
 
 
 class _Embedder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, rng, linear, requires_grad):
+    def __init__(self, input_dim, hidden_dim, rng, linear, requires_grad, fused=False):
         super().__init__(requires_grad=requires_grad)
-        self.norm = _UnitBatchNorm(input_dim, requires_grad)
+        self.norm = _batch_norm(input_dim, requires_grad, fused)
         self.w = _UnitLinear(input_dim, hidden_dim, rng, linear, requires_grad)
         super().__post_init__()
 
@@ -187,20 +204,25 @@ class _Embedder(nn.Module):
 
 
 class _ResidualBlock(nn.Module):
-    def __init__(self, hidden_dim, rng, linear, requires_grad):
+    def __init__(self, hidden_dim, rng, linear, requires_grad, fused=False):
         super().__init__(requires_grad=requires_grad)
         self.w1 = _UnitLinear(hidden_dim, hidden_dim * 4, rng, linear, requires_grad)
         self.w2 = _UnitLinear(hidden_dim * 4, hidden_dim, rng, linear, requires_grad)
-        self.norm1 = _UnitBatchNorm(hidden_dim * 4, requires_grad)
-        self.norm2 = _UnitBatchNorm(hidden_dim, requires_grad)
+        self.norm1 = _batch_norm(hidden_dim * 4, requires_grad, fused, relu=True)
+        self.norm2 = _batch_norm(hidden_dim, requires_grad, fused, relu=True)
+        self.fused = fused
         self.relu1 = nn.ReLU(requires_grad=requires_grad)
         self.relu2 = nn.ReLU(requires_grad=requires_grad)
         self.add = nn.Add(requires_grad=requires_grad)
         super().__post_init__()
 
     def __call__(self, input: wp.array) -> wp.array:
-        output = self.relu1(self.norm1(self.w1(input)))
-        output = self.relu2(self.norm2(self.w2(output)))
+        output = self.norm1(self.w1(input))
+        if not self.fused:
+            output = self.relu1(output)
+        output = self.norm2(self.w2(output))
+        if not self.fused:
+            output = self.relu2(output)
         return self.add(output, input)
 
 
@@ -229,12 +251,51 @@ class _FlashNetwork(nn.Module):
 
     def normalize_parameters(self) -> None:
         """Apply the authors' projections after an Adam update, outside its tape."""
+        if getattr(self, "fused_updates", False):
+            from robolearn.cuda.flash import CudaProjection
+            from robolearn.cuda.normalization import CudaBatchNorm, CudaRMSNorm
+
+            if not hasattr(self, "_projection"):
+                rows, affines, scales = [], [], []
+                for module in self._all_modules():
+                    if isinstance(module, _UnitLinear):
+                        rows.append(module.w.weight.data)
+                    elif isinstance(module, CudaBatchNorm):
+                        affines.append((module.weight.data, module.bias.data))
+                    elif isinstance(module, CudaRMSNorm):
+                        scales.append(module.weight.data)
+                self._projection = CudaProjection(rows=rows, affines=affines, scales=scales).prepare()
+            self._projection.step()
+            return
         pending = list(self.modules())
         while pending:
             module = pending.pop()
             if isinstance(module, (_UnitLinear, _UnitBatchNorm, _UnitRMSNorm)):
                 module.normalize_parameters()
             pending.extend(module.modules())
+
+    def _all_modules(self):
+        pending, seen = list(self.modules()), set()
+        while pending:
+            module = pending.pop()
+            if id(module) in seen:
+                continue
+            seen.add(id(module))
+            yield module
+            pending.extend(module.modules())
+
+    @contextmanager
+    def precision(self, compute_dtype: str):
+        """Select native dense precision for a forward, retaining FP32 owned arrays."""
+        layers = [module for module in self._all_modules() if hasattr(module, "compute_dtype")]
+        previous = [layer.compute_dtype for layer in layers]
+        try:
+            for layer in layers:
+                layer.compute_dtype = compute_dtype
+            yield self
+        finally:
+            for layer, dtype in zip(layers, previous, strict=True):
+                layer.compute_dtype = dtype
 
     @contextmanager
     def freeze_parameters(self):
@@ -257,14 +318,17 @@ class _FlashNetwork(nn.Module):
 
 
 class _Backbone(_FlashNetwork):
-    def __init__(self, input_dim, hidden_dim, num_blocks, rng, linear, requires_grad):
+    def __init__(self, input_dim, hidden_dim, num_blocks, rng, linear, requires_grad, fused=False):
         super().__init__(requires_grad=requires_grad)
-        self.embedder = self.register_module("embedder", _Embedder(input_dim, hidden_dim, rng, linear, requires_grad))
+        self.fused_updates = fused
+        self.embedder = self.register_module(
+            "embedder", _Embedder(input_dim, hidden_dim, rng, linear, requires_grad, fused)
+        )
         self.encoder = tuple(
-            self.register_module(f"encoder.{i}", _ResidualBlock(hidden_dim, rng, linear, requires_grad))
+            self.register_module(f"encoder.{i}", _ResidualBlock(hidden_dim, rng, linear, requires_grad, fused))
             for i in range(num_blocks)
         )
-        self.post_norm = self.register_module("post_norm", _UnitRMSNorm(hidden_dim, requires_grad))
+        self.post_norm = self.register_module("post_norm", _rms_norm(hidden_dim, requires_grad, fused))
 
     def features(self, input: wp.array) -> wp.array:
         output = self.embedder(input)
@@ -320,13 +384,15 @@ class FlashActor(_Backbone):
         optimized_linear_backward: bool = True,
         requires_grad: bool = True,
         dense_backend: str = "warp",
+        compute_dtype: str = "float32",
+        fused_updates: bool = False,
     ):
-        linear = _linear_type(dense_backend, optimized_linear_backward)
+        linear = _linear_type(dense_backend, optimized_linear_backward, compute_dtype)
         if min(observation_dim, action_dim, hidden_dim) <= 0 or num_blocks < 0:
             raise ValueError("Network dimensions must be positive and block count nonnegative.")
         with wp.ScopedDevice(device):
             rng = np.random.default_rng(seed)
-            super().__init__(observation_dim, hidden_dim, num_blocks, rng, linear, requires_grad)
+            super().__init__(observation_dim, hidden_dim, num_blocks, rng, linear, requires_grad, fused_updates)
             self.predictor = self.register_module(
                 "predictor", _ActorHead(hidden_dim, action_dim, rng, linear, requires_grad)
             )
@@ -377,8 +443,10 @@ class _ValueHead(nn.Module):
 
 
 class _ValueNetwork(_Backbone):
-    def __init__(self, input_dim, hidden_dim, num_blocks, num_bins, min_v, max_v, rng, linear, requires_grad):
-        super().__init__(input_dim, hidden_dim, num_blocks, rng, linear, requires_grad)
+    def __init__(
+        self, input_dim, hidden_dim, num_blocks, num_bins, min_v, max_v, rng, linear, requires_grad, fused=False
+    ):
+        super().__init__(input_dim, hidden_dim, num_blocks, rng, linear, requires_grad, fused)
         self.predictor = self.register_module(
             "predictor", _ValueHead(hidden_dim, num_bins, min_v, max_v, rng, linear, requires_grad)
         )
@@ -411,12 +479,15 @@ class FlashDoubleCritic(_FlashNetwork):
         optimized_linear_backward: bool = True,
         requires_grad: bool = True,
         dense_backend: str = "warp",
+        compute_dtype: str = "float32",
+        fused_updates: bool = False,
     ):
-        linear = _linear_type(dense_backend, optimized_linear_backward)
+        linear = _linear_type(dense_backend, optimized_linear_backward, compute_dtype)
         if min(observation_dim, action_dim, hidden_dim) <= 0 or num_blocks < 0 or num_bins < 2 or min_v >= max_v:
             raise ValueError("Invalid categorical critic dimensions or support.")
         with wp.ScopedDevice(device):
             super().__init__(requires_grad=requires_grad)
+            self.fused_updates = fused_updates
             rng = np.random.default_rng(seed)
             self.critics = tuple(
                 self.register_module(
@@ -431,6 +502,7 @@ class FlashDoubleCritic(_FlashNetwork):
                         rng,
                         linear,
                         requires_grad,
+                        fused_updates,
                     ),
                 )
                 for i in range(2)

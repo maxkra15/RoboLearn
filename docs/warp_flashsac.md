@@ -8,6 +8,12 @@ Construction emits a `RuntimeWarning`; selecting Warp PPO does not import this
 backend or its kernels. The recommended FlashSAC path remains the authors' Torch
 implementation in `robolearn.flashsac`.
 
+The optional [native CUDA backend](cuda.md#native-flashsac-mixed-precision-and-fusion)
+adds FP16 dense compute with FP32 state, dynamic loss scaling, and fused native
+normalization/projection/EMA. Select it explicitly with `dense_backend="cuda"`,
+`FlashSACConfig(use_amp=True)` and `fused_updates=True`. The default Warp backend
+retains its FP32 implementation. The dated measurements below precede these options.
+
 ## Current performance (2026-10-20)
 
 The [current-stack report](https://maxkra15.github.io/reports/2026-10-20-g1-main-baselines/)
@@ -65,8 +71,9 @@ optimizer updates also need numerical care. FP32 is the first implementation so
 fixed-data comparisons can isolate porting errors. The current Torch G1 recipe
 uses FP16 AMP; comparisons must label that precision difference explicitly.
 
-Warp-NN's built-in training layers use FP32. A mixed precision backend would need
-additional layer and optimizer work, followed by numerical and learning checks.
+Warp-NN's built-in training layers use FP32. The optional native backend supplies
+the mixed-precision dense layers and scaling optimizer; it still requires
+numerical and learning checks on the intended workload.
 Warp-NN's CUDA capture support does not guarantee faster kernels than optimized
 Torch libraries. Measure preparation, warmed actor inference, replay insertion,
 warmed updates, and complete training separately.

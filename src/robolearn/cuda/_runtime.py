@@ -39,8 +39,10 @@ def build_library(*, architecture: int | str, compiler: str | None = None, cache
     version = subprocess.run([executable, "--version"], check=True, capture_output=True, text=True).stdout
     source = Path(__file__).with_name("kernels.cu")
     flags = ["-std=c++17", "-O3", "--shared", "-Xcompiler=-fPIC", "--fmad=false", f"-arch=sm_{architecture}"]
+    headers = sorted(source.parent.glob("*.cuh"))
     identity = {
         "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "headers_sha256": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in headers},
         "compiler": executable,
         "compiler_version": version,
         "architecture": architecture,
@@ -80,6 +82,10 @@ def _declare(library):
     library.rl_last_error.restype = ctypes.c_char_p
     library.rl_plan_create.argtypes = [integer] * 8 + [integer, integer, size]
     library.rl_plan_create.restype = pointer
+    library.rl_plan_create_mixed.argtypes = [integer] * 11 + [size]
+    library.rl_plan_create_mixed.restype = pointer
+    library.rl_cast_f32_f16.argtypes = [pointer, pointer, size, pointer]
+    library.rl_cast_f32_f16.restype = integer
     library.rl_plan_workspace.argtypes = [pointer]
     library.rl_plan_workspace.restype = size
     library.rl_plan_destroy.argtypes = [pointer]
@@ -95,6 +101,10 @@ def _declare(library):
     library.rl_adam_create.restype = pointer
     library.rl_adam_step.argtypes = [pointer, pointer]
     library.rl_adam_step.restype = integer
+    library.rl_adam_set_scaler.argtypes = [pointer] * 7 + [ctypes.c_double, ctypes.c_double, integer]
+    library.rl_adam_set_scaler.restype = integer
+    library.rl_adam_unscale.argtypes = [pointer, pointer]
+    library.rl_adam_unscale.restype = integer
     library.rl_adam_destroy.argtypes = [pointer]
     library.rl_adam_destroy.restype = integer
 

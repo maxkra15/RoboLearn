@@ -19,6 +19,7 @@ import platform
 import sys
 import time
 import traceback
+from collections import defaultdict
 from dataclasses import asdict, fields, replace
 from pathlib import Path
 
@@ -309,9 +310,10 @@ def run_backend(agent, name, args, transitions, common_weights, reference_replay
     row = {
         "backend": name,
         "status": "PREPARING",
-        "precision": "fp32" if native or args.recipe == "fp32" else "fp16_amp",
+        "precision": "fp16_dense_fp32_state" if native and cfg.use_amp else "fp16_amp" if cfg.use_amp else "fp32",
+        "fused_updates": native and agent.fused_updates,
         "resolved_config": asdict(cfg),
-        "network_compile": not native and args.recipe == "amp",
+        "network_compile": not native and cfg.use_compile,
         "captured_update": native,
         "metric_cadence": "Every update returns the same 7 actor-phase / 2 critic-phase scalar metrics on CPU.",
         "actor_timing_scope": "Public action API, normalized actions copied to a CPU NumPy array on every call.",
@@ -392,6 +394,7 @@ def run_backend(agent, name, args, transitions, common_weights, reference_replay
         block["warmup_seconds"] = time.perf_counter() - start
         block["actor_seconds_per_call"] = timed(actor, args.actor_calls, device)
         steps_before = optimizer_steps(agent)
+        amp_before = native_amp_state(agent) if native else {}
         device_counters_before = agent.update_counters.numpy().copy() if native else None
         first_phase = agent._update_step
         metric_keys.clear()
@@ -419,6 +422,13 @@ def run_backend(agent, name, args, transitions, common_weights, reference_replay
             block["device_update_counters_after_critic_actor_temperature"] = device_counters_after.tolist()
             block["exact_device_update_counts"] = bool(
                 np.array_equal(device_counters_after - device_counters_before, [args.updates, actor_calls, actor_calls])
+            )
+            amp_after = native_amp_state(agent)
+            block["amp_state_after"] = amp_after
+            block["amp_counters_match_optimizer_counts"] = all(
+                amp_after[key]["attempted_steps"] - amp_before[key]["attempted_steps"] == attempts[key]
+                and amp_after[key]["skipped_steps"] - amp_before[key]["skipped_steps"] == attempts[key] - actual[key]
+                for key in amp_after
             )
         measured_metric_keys.update(metric_keys)
         write_json(args.output, result)
@@ -479,7 +489,8 @@ def run_backend(agent, name, args, transitions, common_weights, reference_replay
         "valid_optimizer_counts": all(0 <= actual[key] <= attempts[key] for key in attempts),
         "all_optimizer_groups_made_measured_progress": all(actual[key] > 0 for key in attempts),
         "temperature_updates_completed": actual["temperature"] == attempts["temperature"],
-        "fp32_updates_completed": (args.recipe == "amp" and not native) or attempts == actual,
+        "fp32_updates_completed": cfg.use_amp or attempts == actual,
+        "native_amp_counters": all(block.get("amp_counters_match_optimizer_counts", True) for block in row["blocks"]),
     }
     row["status"] = "PASSED" if all(row["checks"].values()) else "FAILED"
     write_json(args.output, result)
@@ -489,14 +500,65 @@ def run_backend(agent, name, args, transitions, common_weights, reference_replay
     # replay fixture is stored separately rather than duplicating its capacity.
     agent.save(str(artifact_root / name))
     row["checkpoint_saved"] = True
+    if native and args.profile_native:
+        row["profile"] = profile_native(agent, artifact_root / (name + "-trace.json"), args.updates)
     write_json(args.output, result)
     return reference_replay
+
+
+def native_amp_state(agent):
+    return {
+        name: {key: value.numpy().tolist()[0] for key, value in optimizer.state_arrays().items()}
+        for name, optimizer in (("actor", agent.actor_optimizer), ("critic", agent.critic_optimizer))
+        if optimizer.dynamic_loss_scale
+    }
+
+
+def profile_native(agent, path, measured_calls):
+    """Record device kernels outside timing, restoring the entire learner afterward."""
+    before = agent.state_dict(include_replay=False)
+    trace = {"calls": min(8, measured_calls), "included_in_update_timing": False}
+    try:
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+        ) as profiler:
+            with torch.profiler.record_function("native_flashsac_graph_updates"):
+                for _ in range(trace["calls"]):
+                    agent.update()
+                wp.synchronize_device(agent.device)
+        profiler.export_chrome_trace(str(path))
+        events = json.loads(path.read_text()).get("traceEvents", [])
+        totals = defaultdict(lambda: {"calls": 0, "microseconds": 0.0})
+        for event in events:
+            if event.get("cat") == "kernel" and event.get("ph") == "X":
+                group = totals[event["name"]]
+                group["calls"] += 1
+                group["microseconds"] += event.get("dur", 0.0)
+        trace["device_kernel_totals"] = sorted(totals.items(), key=lambda row: row[1]["microseconds"], reverse=True)
+        trace["status"] = "RECORDED" if totals else "NO_DEVICE_KERNEL_EVENTS"
+    except Exception as error:
+        # Profiling availability is separate from numerical/optimizer validity.
+        trace.update(status="UNAVAILABLE", error=f"{type(error).__name__}: {error}")
+    finally:
+        agent.load_state_dict(before)
+    after = agent.state_dict(include_replay=False)
+    trace["learner_state_restored_exactly"] = all(np.array_equal(value, after[key]) for key, value in before.items())
+    if not trace["learner_state_restored_exactly"]:
+        raise RuntimeError("Profiling changed the recorded learner state after restoration")
+    return trace
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--official-root", type=Path, default=os.environ.get("OFFICIAL_FLASHSAC_ROOT"))
     parser.add_argument("--recipe", choices=("fp32", "amp"), default="fp32")
+    parser.add_argument("--compile-fp32", action="store_true", help="Compile Torch networks without enabling AMP.")
+    parser.add_argument(
+        "--native-variants", nargs="+", choices=("fp32", "fp32-fused", "amp", "amp-fused"), default=["fp32"]
+    )
+    parser.add_argument(
+        "--profile-native", action="store_true", help="Export an untimed CUDA kernel trace per native row."
+    )
     parser.add_argument(
         "--allow-tf32",
         action="store_true",
@@ -541,13 +603,14 @@ def main():
         "limitations": [
             "No terminal or timeout fixtures: upstream and RoboLearn timeout-discount semantics differ.",
             "Common replay population and initial weights do not imply identical RNG draws or trained trajectories.",
-            "FP32 recipe disables network compile, but official categorical/reward/zeta helpers still compile unconditionally.",
-            "AMP recipe enables authors' auto max-autotune/FP16 AMP; native CUDA remains FP32, not equal precision.",
+            "Torch FP32 network compilation is controlled by --compile-fp32; official helpers always compile.",
+            "Native FP16 dense operands retain FP32 accumulation, outputs, activations, master weights and Adam.",
+            "Native mixed precision therefore differs from Torch autocast intermediate rounding.",
             "Per-call CPU action copies are included in every actor row; simulator/device-only rollout performance is unmeasured.",
             "Single-process descriptive timings include Python/default logging overhead and cache/order effects.",
             "Each timing block continues from the previous block; the three blocks are not three independent training seeds.",
             (
-                "Torch allows TF32/high matmul as in the authors' launcher; native CUDA stays strict FP32."
+                "Torch allows TF32/high matmul as in the authors' launcher; native FP32 remains pedantic."
                 if args.allow_tf32
                 else "Torch TF32 is disabled/highest matmul for the controlled FP32 comparison."
             ),
@@ -575,7 +638,7 @@ def main():
             "torch_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
             "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
             "cudnn_benchmark": torch.backends.cudnn.benchmark,
-            "native_compute_type": "CUBLAS_COMPUTE_32F_PEDANTIC",
+            "native_compute_types": {"fp32": "CUBLAS_COMPUTE_32F_PEDANTIC", "fp16": "CUBLAS_COMPUTE_32F"},
             "jax_platforms": os.environ.get("JAX_PLATFORMS"),
             "benchmark_dependencies": {
                 name: importlib.metadata.version(name) for name in ("gymnasium", "omegaconf", "jax", "jaxlib")
@@ -585,7 +648,7 @@ def main():
         result["robolearn_sources_sha256"] = {
             str(path.relative_to(package_root)): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in sorted(package_root.rglob("*"))
-            if path.suffix in (".py", ".cu") and path.is_file()
+            if path.suffix in (".py", ".cu", ".cuh") and path.is_file()
         }
         wp.init()
         cfg = FlashSACConfig(
@@ -594,7 +657,7 @@ def main():
             buffer_max_length=max(65536, 16 * args.num_envs),
             buffer_min_length=args.num_envs,
             sample_batch_size=args.batch_size,
-            use_compile=args.recipe == "amp",
+            use_compile=args.recipe == "amp" or args.compile_fp32,
             use_amp=args.recipe == "amp",
             learning_rate_decay_step=98400,
         )
@@ -675,28 +738,35 @@ def main():
         stream.wait_stream(wp.get_stream(args.device))
         mirror.wait_stream(torch.cuda.current_stream(device))
         with wp.ScopedStream(stream, sync_enter=False), torch.cuda.stream(mirror):
-            start = time.perf_counter()
-            native = WarpFlashSAC(
-                args.observations,
-                args.actions,
-                num_envs=args.num_envs,
-                cfg=replace(cfg, use_compile=False, use_amp=False),
-                dense_backend="cuda",
-            )
-            torch.cuda.synchronize(device)
-            native_startup = {"construction_seconds": time.perf_counter() - start}
-            run_backend(
-                native,
-                "robolearn_native_cuda",
-                args,
-                transitions,
-                common_weights,
-                reference_replay,
-                result,
-                artifact_root,
-                native_startup,
-            )
-        result["resolved_configs"]["robolearn_native_cuda"] = asdict(native.cfg)
+            for variant in dict.fromkeys(args.native_variants):
+                start = time.perf_counter()
+                native = WarpFlashSAC(
+                    args.observations,
+                    args.actions,
+                    num_envs=args.num_envs,
+                    cfg=replace(cfg, use_compile=False, use_amp=variant.startswith("amp")),
+                    dense_backend="cuda",
+                    fused_updates=variant.endswith("-fused"),
+                )
+                torch.cuda.synchronize(device)
+                native_startup = {"construction_seconds": time.perf_counter() - start}
+                name = (
+                    "robolearn_native_cuda"
+                    if variant == "fp32"
+                    else "robolearn_native_cuda_" + variant.replace("-", "_")
+                )
+                run_backend(
+                    native,
+                    name,
+                    args,
+                    transitions,
+                    common_weights,
+                    reference_replay,
+                    result,
+                    artifact_root,
+                    native_startup,
+                )
+                result["resolved_configs"][name] = asdict(native.cfg)
         result["status"] = "PASSED"
         write_json(args.output, result)
         print(json.dumps({"status": result["status"], "output": str(args.output)}, allow_nan=False))
