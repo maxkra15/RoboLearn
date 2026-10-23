@@ -116,6 +116,54 @@ full optimizer step, not only inference or one GEMM, and report precision, shape
 attempted/completed updates and numerical health. Synthetic timings establish
 neither walking quality nor time to a trained policy. No speedup is promised.
 
+### L40 measurements, 23 October 2026
+
+Source: [`c4dd800`](https://github.com/maxkra15/RoboLearn/commit/c4dd800c5d4ffd7dd2c2629862e4ee02eab04e48).
+One NVIDIA L40, CUDA 13.0, Torch 2.11.0, Warp 1.17.0 and Warp-NN 0.4.1.
+These are synchronized mean update times from fixed synthetic data. The native
+backend requests pedantic FP32; Torch TF32 was disabled. Compilation and
+preparation are excluded from the table.
+
+| Learner | Implementation | Milliseconds per update |
+| --- | --- | ---: |
+| PPO | Warp, captured FP32 | 57.171 |
+| PPO | Native dense/Adam, captured FP32 | 31.174 |
+| FlashSAC | Warp, captured FP32 | 29.864 |
+| FlashSAC | Native dense/Adam, captured FP32 | 12.979 |
+| FlashSAC | Torch, eager FP32 | 11.487 |
+| FlashSAC | Torch, compiled FP16 AMP | 4.027 |
+
+PPO uses 123 observations, 37 actions, hidden widths 256/128/128, 1,024 worlds,
+a 24-step rollout and five epochs with four minibatches. Each table update
+contains 20 optimizer steps; 50 measured calls completed all 1,000 steps per
+backend after five warmup calls. The native backend achieved a **1.83x speedup**
+over Warp.
+
+FlashSAC retains the existing residual actor and twin categorical critics,
+with batch size 2,048. Each update is one critic/replay call; actor and
+temperature updates occur every second call. Each recipe completed 100 critic,
+50 actor and 50 temperature steps, with zero skipped optimizer steps. Warmup was
+10 calls for FP32 and 20 for the AMP comparison. Native FP32 achieved a **2.30x
+speedup** over Warp FP32, but Torch FP32 and compiled AMP remained faster than
+native FP32. PPO and FlashSAC update units differ.
+
+Native dense forward/backward and Adam passed their FP64 reference checks.
+Both PPO backends restored checkpoints exactly and successfully replayed an
+update after loading. Native PPO passed the recorded long-update numerical
+budgets, with maximum eager/captured state difference `1.54e-5`. The small native
+PPO/Torch reference passed, with parameter and Adam-moment errors below `1.1e-6`.
+The stock Warp PPO first-moment array for the distribution parameter exceeded
+its float-array budget; its exact counters and all adaptive learning-rate
+decisions matched. This difference remains explicitly recorded in the raw data.
+
+These measurements cover dense operations and Adam together. They use sequential
+processes on one GPU, with cache reuse and order effects. Torch AMP warmup took
+480 seconds, including compilation and autotuning; startup measurements are
+reported by the scripts but do not constitute an independently cold comparison.
+No environment was trained or evaluated in this experiment. The backend remains
+experimental; full policy learning checks and profiling of the remaining
+normalization/reduction work are needed before recommending it for training.
+
 The native CUDA code is original RoboLearn code. Algorithm authors and upstream
 FlashSAC attribution remain in [ATTRIBUTION.md](../ATTRIBUTION.md) and
 [CITATIONS.bib](../CITATIONS.bib). Warp-NN and NVIDIA CUDA libraries retain their
