@@ -106,6 +106,11 @@ also compares a complete update with Torch formulas. FlashSAC uses shared initia
 weights for descriptive component measurements; its stochastic trajectories and
 optimizer state diverge across recipes.
 
+Long PPO update differences are recorded separately from the mandatory primitive,
+control-state, finite-weight and checkpoint checks. `--strict-ppo-parity` also
+requires every recorded FP32 trajectory budget to pass. A timing result with
+numerical differences is labeled explicitly and does not establish equivalence.
+
 Report compilation/preparation separately from warmed update time. Compare a
 full optimizer step, not only inference or one GEMM, and report precision, shapes,
 attempted/completed updates and numerical health. Synthetic timings establish
