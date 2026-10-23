@@ -32,6 +32,7 @@ every loss in CUDA C++.
 
 Install RoboLearn's `warp` extra in the supported environment, plus an NVCC CUDA
 development toolkit with cuBLASLt headers/libraries and a compatible C++ compiler.
+The initial native backend supports Linux and a single CUDA device per learner.
 There is no additional Torch dependency or vendored CUDA library.
 
 ```python

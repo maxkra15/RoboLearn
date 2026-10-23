@@ -24,8 +24,197 @@ def error(value, reference):
         "max_abs": float(np.max(np.abs(difference))),
         "reference_max_abs": float(np.max(np.abs(reference))),
         "relative_rms": float(np.linalg.norm(difference) / max(np.linalg.norm(reference), 1e-12)),
-        "finite": bool(np.isfinite(value).all()),
+        "finite": bool(np.isfinite(value).all() and np.isfinite(reference).all()),
     }
+
+
+@wp.kernel(enable_backward=False)
+def _record_ppo_schedule(
+    learning_rate: wp.array[wp.float32],
+    kl: wp.array[wp.float32],
+    desired_kl: float,
+    cursor: wp.array[wp.int32],
+    rates: wp.array[wp.float32],
+    decisions: wp.array[wp.int32],
+    divergences: wp.array[wp.float32],
+):
+    index = cursor[0]
+    if index < rates.shape[0]:
+        rates[index] = learning_rate[0]
+        divergences[index] = kl[0]
+        decision = int(0)
+        if kl[0] > desired_kl * 2.0:
+            decision = -1
+        elif kl[0] < desired_kl / 2.0 and kl[0] > 0.0:
+            decision = 1
+        decisions[index] = decision
+    cursor[0] = index + 1
+
+
+class _PPOScheduleTrace:
+    """Observe device scheduler state without changing the learner's update math.
+
+    The temporary observer graph is discarded before timing. The production
+    graph is subsequently recaptured without these diagnostic kernels.
+    """
+
+    def __init__(self, agent):
+        self.agent = agent
+        self.launch = agent.launch_update
+        self.step = agent.optimizer.step
+        count = agent.config.epochs * agent.config.num_mini_batches
+        self.cursor = wp.zeros(1, dtype=wp.int32, device=agent.device)
+        self.rates = wp.zeros(count, dtype=wp.float32, device=agent.device)
+        self.decisions = wp.zeros(count, dtype=wp.int32, device=agent.device)
+        self.divergences = wp.zeros(count, dtype=wp.float32, device=agent.device)
+
+    def __enter__(self):
+        self.agent._update_graph = None
+        self.agent.launch_update = self._launch
+        self.agent.optimizer.step = self._step
+        return self
+
+    def __exit__(self, *_):
+        self.agent.launch_update = self.launch
+        self.agent.optimizer.step = self.step
+        self.agent._update_graph = None
+
+    def _launch(self):
+        self.cursor.zero_()
+        self.launch()
+
+    def _step(self, *, lr=None):
+        wp.launch(
+            _record_ppo_schedule,
+            dim=1,
+            inputs=[
+                self.agent.optimizer._lr,
+                self.agent.kl,
+                self.agent.config.desired_kl,
+                self.cursor,
+                self.rates,
+                self.decisions,
+                self.divergences,
+            ],
+            device=self.agent.device,
+        )
+        self.step(lr=lr)
+
+    def snapshot(self):
+        return {
+            "recorded_minibatches": int(self.cursor.numpy()[0]),
+            "learning_rates": self.rates.numpy().tolist(),
+            "adaptive_decisions": self.decisions.numpy().tolist(),
+            "kl": self.divergences.numpy().tolist(),
+        }
+
+
+def _ppo_parity(initial, eager, repeated, captured, schedules, expected_updates):
+    """Bound FP32 state drift using scale and an observed eager repeat baseline."""
+    absolute_floor, nominal_relative, hard_relative, repeat_multiplier = 2e-5, 1e-4, 1e-3, 4.0
+    controls = {}
+    expected = {
+        "seed": initial["seed"] + 1,
+        "adam_timestep": initial["adam_timestep"] + expected_updates,
+    }
+    for key, value in expected.items():
+        controls[key] = all(np.array_equal(state[key], value) for state in (eager, repeated, captured))
+    controls["final_learning_rate"] = all(
+        np.array_equal(eager["adam_lr"], state["adam_lr"]) for state in (repeated, captured)
+    )
+    controls["schedule_finite"] = all(
+        np.isfinite(schedule["learning_rates"]).all() and np.isfinite(schedule["kl"]).all() for schedule in schedules
+    )
+    controls["all_minibatches_observed"] = all(
+        schedule["recorded_minibatches"] == expected_updates for schedule in schedules
+    )
+    for field in ("learning_rates", "adaptive_decisions"):
+        controls[field] = all(schedules[0][field] == schedule[field] for schedule in schedules[1:])
+    controls["finite_all_state_arrays"] = all(
+        np.isfinite(value).all() for state in (initial, eager, repeated, captured) for value in state.values()
+    )
+    arrays, failures = {}, []
+    for key in eager:
+        if not (key.startswith("parameter_") or key.startswith(("adam_m1_", "adam_m2_"))):
+            continue
+        reference = eager[key].astype(np.float64)
+        baseline = repeated[key].astype(np.float64) - reference
+        difference = captured[key].astype(np.float64) - reference
+        finite = bool(np.isfinite(reference).all() and np.isfinite(baseline).all() and np.isfinite(difference).all())
+        reference_max = float(np.max(np.abs(reference))) if finite else 0.0
+        reference_rms = float(np.sqrt(np.mean(reference**2))) if finite else 0.0
+        metrics = {}
+        accepted = finite
+        for name, residual, scale in (
+            ("max_abs", lambda value: np.max(np.abs(value)), reference_max),
+            ("rms_abs", lambda value: np.sqrt(np.mean(value**2)), reference_rms),
+        ):
+            baseline_value = float(residual(baseline)) if finite else None
+            captured_value = float(residual(difference)) if finite else None
+            nominal = absolute_floor + nominal_relative * scale
+            hard = absolute_floor + hard_relative * scale
+            limit = min(hard, max(nominal, repeat_multiplier * baseline_value)) if finite else nominal
+            passed = finite and baseline_value <= hard and captured_value <= limit
+            accepted = accepted and passed
+            metrics[name] = {
+                "eager_repeat": baseline_value,
+                "eager_captured": captured_value,
+                "reference_scale": scale,
+                "nominal_limit": nominal,
+                "hard_limit": hard,
+                "capture_limit": limit,
+                "accepted": bool(passed),
+            }
+        arrays[key] = {"finite": finite, "accepted": bool(accepted), **metrics}
+        if not accepted:
+            failures.append(key)
+    failures.extend(f"control:{key}" for key, passed in controls.items() if not passed)
+    return {
+        "accepted": not failures,
+        "criterion": {
+            "absolute_floor": absolute_floor,
+            "nominal_relative": nominal_relative,
+            "hard_relative": hard_relative,
+            "eager_repeat_multiplier": repeat_multiplier,
+            "description": (
+                "Per-array max and RMS residuals: nominal absolute+relative budget, or up to four times "
+                "same-device eager-repeat residual, bounded by the hard absolute+relative budget. "
+                "The eager baseline must itself fit the hard budget. RNG/update counters and all scheduler "
+                "learning rates/branch decisions must match exactly. This is FP32 numerical agreement, not bit identity."
+            ),
+        },
+        "controls": controls,
+        "control_values": {
+            key: {
+                label: state[key].tolist()
+                for label, state in zip(
+                    ("initial", "eager", "eager_repeat", "captured"), (initial, eager, repeated, captured), strict=True
+                )
+            }
+            for key in ("seed", "adam_timestep", "adam_lr")
+        },
+        "schedules": {key: value for key, value in zip(("eager", "eager_repeat", "captured"), schedules, strict=True)},
+        "arrays": arrays,
+        "offending_keys": failures,
+    }
+
+
+def _write_result(path, result):
+    def finite_json(value):
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        if isinstance(value, list):
+            return [finite_json(item) for item in value]
+        if isinstance(value, dict):
+            return {key: finite_json(item) for key, item in value.items()}
+        return value
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    # Failed finite checks must remain serializable. Native NPZ snapshots retain
+    # original values; JSON represents nonfinite diagnostic scalars as null.
+    temporary.write_text(json.dumps(finite_json(result), indent=2, allow_nan=False) + "\n")
+    temporary.replace(path)
 
 
 def dense_timing(layer, source, cotangent, calls=50):
@@ -177,7 +366,7 @@ def adam_diagnostic():
     return {"tensors": comparisons, "optimizer_steps": counter}
 
 
-def ppo_measurements(warmup, updates, checkpoint_dir):
+def ppo_measurements(warmup, updates, checkpoint_dir, progress):
     cfg = PPOConfig(
         hidden_dims=(256, 128, 128),
         activation="elu",
@@ -228,17 +417,40 @@ def ppo_measurements(warmup, updates, checkpoint_dir):
         for key, value in data.items():
             getattr(agent, key).assign(value)
         agent.warmup()
-        # Capture and execute once, then restore initial model/optimizer/RNG state.
-        agent.update(capture=True)
-        agent.load_state_dict(initial)
-        agent.update(capture=False)
-        eager = agent.state_dict()
-        agent.load_state_dict(initial)
-        agent.update(capture=True)
-        captured = agent.state_dict()
-        capture_error = max(float(np.max(np.abs(eager[key] - captured[key]))) for key in eager)
-        if capture_error > 2e-5:
-            raise RuntimeError(f"{backend} eager/captured state differs: {capture_error}")
+        with _PPOScheduleTrace(agent) as trace:
+            # Build the observed graph first. Restore exactly the same public
+            # model/optimizer/RNG state before each measured diagnostic update.
+            agent.update(capture=True)
+            states, schedules = [], []
+            for captured_mode in (False, False, True):
+                agent.load_state_dict(initial)
+                agent.update(capture=captured_mode)
+                states.append(agent.state_dict())
+                schedules.append(trace.snapshot())
+            eager, repeated, captured = states
+        expected_updates = cfg.epochs * cfg.num_mini_batches
+        parity = _ppo_parity(initial, eager, repeated, captured, schedules, expected_updates)
+        parity["dense_backend"] = backend
+        diagnostics_dir = checkpoint_dir.parent / "diagnostics"
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        native_snapshot = diagnostics_dir / f"{backend}-ppo-parity.npz"
+        np.savez_compressed(
+            native_snapshot,
+            **{
+                f"{label}.{key}": value
+                for label, state in zip(
+                    ("initial", "eager", "eager_repeat", "captured"), (initial, *states), strict=True
+                )
+                for key, value in state.items()
+            },
+        )
+        parity["native_state_snapshot"] = str(native_snapshot)
+        _write_result(diagnostics_dir / f"{backend}-ppo-parity.json", parity)
+        progress("parity", parity)
+        if not parity["accepted"]:
+            raise RuntimeError(f"{backend} PPO numerical parity failed: {parity['offending_keys']}")
+        capture_error = max(item["max_abs"]["eager_captured"] for item in parity["arrays"].values())
+        repeat_error = max(item["max_abs"]["eager_repeat"] for item in parity["arrays"].values())
         if reference_eager is None:
             reference_eager = eager
         one_update_difference = {
@@ -253,6 +465,10 @@ def ppo_measurements(warmup, updates, checkpoint_dir):
                 if key.startswith(("adam_m1_", "adam_m2_"))
             ),
         }
+        # Remove all observer kernels from the timed graph. Existing native
+        # plans/kernels are warm; the clean graph is rebuilt and state restored.
+        agent.load_state_dict(initial)
+        agent.update(capture=True)
         agent.load_state_dict(initial)
         for _ in range(warmup):
             agent.update(capture=True)
@@ -290,18 +506,27 @@ def ppo_measurements(warmup, updates, checkpoint_dir):
                 "precision": "fp32",
                 "captured": True,
                 "preparation_seconds": preparation,
+                "preparation_scope": (
+                    "Construction, fixture creation/assignment (shared fixtures created for the first backend only), "
+                    "warmup, eager-repeat/capture numerical diagnostics, diagnostic JSON/NPZ serialization and clean "
+                    "graph setup. This is not pure JIT or independently cold startup time. Final checkpoint I/O and "
+                    "post-load replay occur after update timing and are excluded from preparation."
+                ),
                 "update_seconds_per_call": seconds / updates,
                 "attempted_optimizer_updates": attempted,
                 "actual_optimizer_updates": actual,
                 "finite": finite,
                 "updated_weights": changed,
                 "eager_capture_max_abs_error": capture_error,
+                "eager_repeat_max_abs_error": repeat_error,
+                "parity_diagnostic": str(diagnostics_dir / f"{backend}-ppo-parity.json"),
                 "one_update_difference_from_warp": one_update_difference,
                 "checkpoint_restored": True,
                 "post_load_captured_update": True,
                 "health": agent.health_metrics(),
             }
         )
+        progress("ppo", records[-1])
     return records
 
 
@@ -323,14 +548,31 @@ def main():
             "gpu": wp.get_device("cuda:0").name,
             "warmup": args.warmup,
             "updates": args.updates,
-            "dense": dense_diagnostics(),
-            "adam": adam_diagnostic(),
-            "ppo": ppo_measurements(args.warmup, args.updates, args.output.parent / "checkpoints"),
+            "status": "RUNNING",
+            "ppo": [],
+            "ppo_parity_checks": [],
             "timing": "Sequential same-GPU synchronized wall timings; preparation excluded from warmed updates.",
             "limits": "One shape set/process; cache reuse and order effects are not controlled; no speed superiority inference.",
         }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
+        _write_result(args.output, result)
+
+        def progress(kind, record):
+            result["ppo_parity_checks" if kind == "parity" else "ppo"].append(record)
+            _write_result(args.output, result)
+
+        try:
+            result["dense"] = dense_diagnostics()
+            _write_result(args.output, result)
+            result["adam"] = adam_diagnostic()
+            _write_result(args.output, result)
+            ppo_measurements(args.warmup, args.updates, args.output.parent / "checkpoints", progress)
+            result["status"] = "PASS"
+        except Exception as exception:
+            result["status"] = "FAILED"
+            result["failure"] = {"type": type(exception).__name__, "message": str(exception)}
+            _write_result(args.output, result)
+            raise
+        _write_result(args.output, result)
     print(json.dumps(result, indent=2, allow_nan=False))
 
 
