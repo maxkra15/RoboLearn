@@ -33,6 +33,67 @@ def restore(arrays, state):
         array.assign(state[name])
 
 
+def grouped_zero(report, rng):
+    from robolearn.cuda.zero import CudaZero
+
+    initial = rng.normal(size=13).astype(np.float32)
+    storage = wp.array(initial)
+    views = (storage[1:6], storage[4:9], storage[1:6], storage[10:12])
+    expected = initial.copy()
+    expected[1:9] = 0
+    expected[10:12] = 0
+    plan = CudaZero(views).prepare()
+    aligned_initial = rng.normal(size=4108).astype(np.float32)
+    aligned = wp.array(aligned_initial)
+    aligned_expected = aligned_initial.copy()
+    aligned_expected[:4103] = 0
+    aligned_plan = CudaZero((aligned[:4103],)).prepare()
+    report.check("aligned_vector_path", aligned.ptr % 16 == 0 and aligned_plan.total_bytes == 4103 * 4)
+    report.check("inventory", plan.array_count == 4 and plan.range_count == 2 and plan.total_bytes == 40)
+    report.check("reordered_inventory", plan.matches(tuple(reversed(views))))
+    plan.step(views)
+    aligned_plan.step()
+    report.arrays("eager_aliases_and_sentinels", storage.numpy(), expected, exact=True)
+    report.arrays("eager_vector_chunk_tail", aligned.numpy(), aligned_expected, exact=True)
+    with wp.ScopedCapture() as capture:
+        plan.step(views)
+        aligned_plan.step()
+    for index in range(2):
+        storage.assign(initial)
+        aligned.assign(aligned_initial)
+        wp.capture_launch(capture.graph)
+        report.arrays(f"captured_aliases_and_sentinels/{index}", storage.numpy(), expected, exact=True)
+        report.arrays(f"captured_vector_chunk_tail/{index}", aligned.numpy(), aligned_expected, exact=True)
+    replacement = wp.array(initial)
+    replacement_views = (replacement[1:6], replacement[4:9], replacement[1:6], replacement[10:12])
+    report.check("changed_storage_rejected", not plan.matches(replacement_views))
+    try:
+        plan.step(replacement_views)
+    except RuntimeError:
+        report.check("changed_storage_raises", True)
+    else:
+        report.check("changed_storage_raises", False)
+    report.arrays("replacement_untouched", replacement.numpy(), initial, exact=True)
+    half = wp.array(initial.astype(np.float16), dtype=wp.float16)
+    strided = wp.array(ptr=storage.ptr, dtype=wp.float32, shape=(3,), strides=(8,), device=storage.device)
+    for name, array in (("float16", half), ("strided", strided)):
+        report.check(f"unsupported/{name}", not CudaZero.supports((array,), storage.device))
+        try:
+            CudaZero((array,))
+        except ValueError:
+            report.check(f"unsupported/{name}/raises", True)
+        else:
+            report.check(f"unsupported/{name}/raises", False)
+    np.savez(
+        report.artifacts / "grouped-zero-fixture.npz",
+        initial=initial,
+        expected=expected,
+        aligned_initial=aligned_initial,
+        aligned_expected=aligned_expected,
+    )
+    report.current.update(arrays=plan.array_count, merged_ranges=plan.range_count, visible_bytes=plan.total_bytes)
+
+
 def difference(actual, reference):
     actual, reference = np.asarray(actual), np.asarray(reference)
     finite = bool(np.isfinite(actual).all() and np.isfinite(reference).all())
@@ -693,6 +754,26 @@ def flash_recipe(report, rng, *, amp, fused, g1=False, updates=8, batch_size=32)
     np.savez_compressed(
         report.artifacts / f"{label}-fixture.npz", **fixed, actor_noise=actor_noise, next_noise=next_noise
     )
+    if fused:
+        plans = {}
+        for name, agent in zip(("eager", "captured"), agents, strict=True):
+            plans[name] = {key: dict(value) for key, value in agent._zero_plan_status.items()}
+            report.check(
+                f"{label}/{name}/native_grouped_zero",
+                set(plans[name]) == {"actor", "critic", "temperature"}
+                and not agent._zero_plan_disabled
+                and all(value["mode"] == "native" for value in plans[name].values()),
+                plans=plans[name],
+            )
+            report.check(
+                f"{label}/{name}/all_plan_adjoints_zero",
+                all(
+                    not np.count_nonzero(array.numpy()) for plan in agent._zero_plans.values() for array in plan._arrays
+                ),
+            )
+        report.current["gradient_zero_plans"] = plans
+    else:
+        report.check(f"{label}/ordinary_clear", all(not agent._zero_plans for agent in agents))
     report.current.update(
         amp=amp,
         fused=fused,
@@ -727,6 +808,7 @@ def main():
             for name, function in (
                 ("dense", dense),
                 ("scaler", scaler),
+                ("grouped-zero", grouped_zero),
                 ("projection-ema", projection_ema),
                 ("normalization", normalization),
                 ("categorical", categorical),

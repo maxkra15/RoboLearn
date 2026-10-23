@@ -487,6 +487,12 @@ def run_backend(agent, name, args, transitions, common_weights, reference_replay
     }
     final = parameter_state(agent)
     np.savez(artifact_root / f"{name}-final-parameters.npz", **final)
+    if native and agent.fused_updates and hasattr(agent, "_zero_plan_status"):
+        row["gradient_zero_plans"] = {key: dict(value) for key, value in agent._zero_plan_status.items()}
+        if set(row["gradient_zero_plans"]) != {"actor", "critic", "temperature"} or not all(
+            value["mode"] == "native" for value in row["gradient_zero_plans"].values()
+        ):
+            raise RuntimeError("Fused native benchmark requires active grouped gradient clears for all phases")
     row.update(
         actor_seconds_per_call=float(np.median([block["actor_seconds_per_call"] for block in row["blocks"]])),
         update_seconds_per_call=float(np.median([block["update_seconds_per_call"] for block in row["blocks"]])),

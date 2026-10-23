@@ -381,6 +381,9 @@ class WarpFlashSAC:
         self._prepared = False
         self._update_graphs = {}
         self._retained_tapes = []
+        self._zero_plans = {}
+        self._zero_plan_disabled = set()
+        self._zero_plan_status = {}
         with wp.ScopedDevice(self.device):
             self.actor = FlashActor(
                 observation_dim,
@@ -633,6 +636,50 @@ class WarpFlashSAC:
         else:
             tape.backward(loss)
 
+    def _zero_tape(self, tape, phase: str) -> None:
+        """Clear a complete phase's adjoints with bounded, verified metadata.
+
+        Network buffers are shape caches and checkpoint loads copy in place.
+        Nevertheless every host launch checks the actual tape inventory. A
+        changed/unsupported inventory permanently uses Warp's original clear
+        for that phase; old metadata stays alive for any existing CUDA graph.
+        """
+        if not self.fused_updates:
+            tape.zero()
+            return
+        if phase not in ("actor", "critic", "temperature"):
+            raise ValueError("Unknown gradient-clear phase")
+        from robolearn.cuda.zero import CudaZero
+
+        gradients = tuple(tape.gradients.values())
+        if phase in self._zero_plan_disabled:
+            tape.zero()
+            return
+        reason = None
+        if not gradients or not CudaZero.supports(gradients, self.device) or not any(g.size for g in gradients):
+            reason = "unsupported_gradient_inventory"
+        plan = self._zero_plans.get(phase)
+        if reason is None and plan is None:
+            if self.device.is_capturing:
+                reason = "gradient_inventory_not_prepared_before_capture"
+            else:
+                plan = CudaZero(gradients).prepare()
+                self._zero_plans[phase] = plan
+        elif reason is None and not plan.matches(gradients):
+            reason = "gradient_pointer_signature_changed"
+        if reason is not None:
+            self._zero_plan_disabled.add(phase)
+            self._zero_plan_status[phase] = {"mode": "warp", "reason": reason}
+            tape.zero()
+            return
+        plan.step(gradients)
+        self._zero_plan_status[phase] = {
+            "mode": "native",
+            "arrays": plan.array_count,
+            "ranges": plan.range_count,
+            "bytes": plan.total_bytes,
+        }
+
     def _update_actor(self, apply_optimizer: bool) -> None:
         self.actor_loss.zero_()
         self.entropy.zero_()
@@ -683,7 +730,7 @@ class WarpFlashSAC:
             if apply_optimizer:
                 self._step(self.actor_optimizer)
                 self.actor.normalize_parameters()
-                tape.zero()
+                self._zero_tape(tape, "actor")
             else:
                 self._retained_tapes.append(tape)
 
@@ -701,7 +748,7 @@ class WarpFlashSAC:
         tape.backward(self.temperature_loss)
         if apply_optimizer:
             self._step(self.temperature_optimizer)
-            tape.zero()
+            self._zero_tape(tape, "temperature")
         else:
             self._retained_tapes.append(tape)
 
@@ -764,7 +811,7 @@ class WarpFlashSAC:
         if apply_optimizer:
             self._step(self.critic_optimizer)
             self.critic.normalize_parameters()
-            tape.zero()
+            self._zero_tape(tape, "critic")
         else:
             self._retained_tapes.append(tape)
 

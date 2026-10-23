@@ -666,3 +666,4 @@ extern "C" int rl_adam_destroy(void* opaque) noexcept {
 
 #include "flash_kernels.cuh"
 #include "categorical_kernels.cuh"
+#include "zero_kernels.cuh"

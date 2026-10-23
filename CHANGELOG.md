@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Batch experimental native FlashSAC adjoint clears with verified persistent
+  pointer inventories and reduce BatchNorm backward coefficients once per channel.
+
 - Optimized experimental native FlashSAC with projection/EMA-managed FP16 weight
   copies, vectorized conversions, tiled batch normalization, and cooperative
   categorical heads and target projection.

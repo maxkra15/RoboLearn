@@ -58,6 +58,12 @@ categorical heads combine bias, log-softmax and expected value, with a matching
 combined backward; target distributions use shared-memory projection. These
 changes preserve the network and loss equations while changing reduction order.
 
+Gradient clearing groups the complete recorded adjoint collection into one native
+launch per optimizer phase. Persistent pointer inventories handle overlapping
+views and preserve Warp's initialization bookkeeping; unsupported or changed
+inventories retain Warp's ordinary clear. BatchNorm reduces backward coefficients
+once per channel before coalesced gradient application, using its existing scratch.
+
 The options are independent: leave `use_amp=False` for a fusion-only experiment,
 or `fused_updates=False` to measure mixed precision with the original Warp
 normalization. The default remains FP32 with fusion disabled. Restore the same
@@ -73,9 +79,9 @@ the learner afterward. Performance and task-learning quality require measurement
 This is a short sequence of GPU kernels captured as a graph. FlashSAC's batch
 normalization, parameter-gradient reductions and optimizer dependencies limit
 whole-network fusion. Its existing residual blocks and categorical critics are
-retained. The algorithm-specific kernels remain authored in Warp and compiled to
-CUDA; this backend replaces dense arithmetic and Adam, rather than reimplementing
-every loss in CUDA C++.
+retained. Replay and remaining loss kernels use Warp. Dense products,
+normalization, categorical heads and targets, parameter projection, target EMA,
+gradient clearing and Adam use native CUDA in the fused path.
 
 ## Use
 

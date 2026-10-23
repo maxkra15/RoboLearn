@@ -258,39 +258,41 @@ __global__ void bn_gradient_partials(const float* x, const float* dy, const floa
     }
 }
 
-// Reduce the existing chunk partials in their original order, then reuse the
-// per-channel statistics for a coalesced batch tile. Only tile zero writes the
-// affine adjoints, so the operation needs no atomics or separate reduce launch.
+// Reduce each channel once in the original chunk order. Keeping these small
+// coefficients separate avoids repeating the same reduction in every dx tile.
+__global__ void bn_gradient_reduce(const float* partial, float* sums, float* dw, float* db,
+                                   int batch, int channels, int chunks) {
+    const int channel = blockIdx.x * Threads + threadIdx.x;
+    if (channel >= channels) return;
+    float sum = 0.0f, sum_x = 0.0f;
+    for (int chunk = 0; chunk < chunks; ++chunk) {
+        sum += partial[chunk * channels + channel];
+        sum_x += partial[(chunks + chunk) * channels + channel];
+    }
+    sums[channel] = sum / static_cast<float>(batch);
+    sums[channels + channel] = sum_x / static_cast<float>(batch);
+    if (dw) dw[channel] += sum_x;
+    if (db) db[channel] += sum;
+}
+
 __global__ void bn_backward_apply(const float* x, const float* dy, const float* output, const float* weight,
-                                  const float* mean, const float* variance, const float* partial, float* sums,
-                                  float* dx, float* dw, float* db, int batch, int channels, int chunks,
-                                  float eps, bool training, bool relu) {
+                                  const float* mean, const float* variance, const float* sums, float* dx,
+                                  int batch, int channels, float eps, bool training, bool relu) {
     const int lane = threadIdx.x % Channels, group = threadIdx.x / Channels;
     const int channel = blockIdx.x * Channels + lane;
     __shared__ float averages[Channels], inverses[Channels], weights[Channels];
     __shared__ float gradient_means[Channels], normalized_means[Channels];
     if (group == 0 && channel < channels) {
-        averages[lane] = mean[channel];
         inverses[lane] = 1.0f / sqrtf(variance[channel] + eps);
         weights[lane] = weight ? weight[channel] : 1.0f;
-        float sum = 0.0f, sum_x = 0.0f;
-        if (training || dw || db) {
-            for (int chunk = 0; chunk < chunks; ++chunk) {
-                sum += partial[chunk * channels + channel];
-                sum_x += partial[(chunks + chunk) * channels + channel];
-            }
-        }
-        gradient_means[lane] = sum / static_cast<float>(batch);
-        normalized_means[lane] = sum_x / static_cast<float>(batch);
-        if (blockIdx.y == 0) {
-            sums[channel] = gradient_means[lane];
-            sums[channels + channel] = normalized_means[lane];
-            if (dw) dw[channel] += sum_x;
-            if (db) db[channel] += sum;
+        if (training) {
+            averages[lane] = mean[channel];
+            gradient_means[lane] = sums[channel];
+            normalized_means[lane] = sums[channels + channel];
         }
     }
     __syncthreads();
-    if (!dx || channel >= channels) return;
+    if (channel >= channels) return;
     const int end = (blockIdx.y + 1) * ApplyRows < batch ? (blockIdx.y + 1) * ApplyRows : batch;
     for (int row = blockIdx.y * ApplyRows + group; row < end; row += Groups) {
         const std::size_t index = static_cast<std::size_t>(row) * channels + channel;
@@ -509,14 +511,15 @@ extern "C" int rl_flash_bn_backward(const float* x, const float* dy, const float
     if (!x || !dy || !y || !mean || !var || !partial || !sums) { set_error("Invalid BN backward arrays."); return -1; }
     const cudaStream_t st = reinterpret_cast<cudaStream_t>(stream);
     const int chunks = (batch + 255) / 256;
-    if (training || dw || db) {
+    if ((training && dx) || dw || db) {
         const dim3 grid((channels + 31) / 32, chunks);
         flash_native::bn_gradient_partials<<<grid, 256, 0, st>>>(x, dy, y, mean, var, partial, batch, channels, chunks, eps, relu != 0);
+        flash_native::bn_gradient_reduce<<<(channels + 255) / 256, 256, 0, st>>>(partial, sums, dw, db, batch, channels, chunks);
     }
-    if (dx || dw || db) {
-        const dim3 grid((channels + 31) / 32, dx ? (batch + flash_native::ApplyRows - 1) / flash_native::ApplyRows : 1);
-        flash_native::bn_backward_apply<<<grid, 256, 0, st>>>(x, dy, y, w, mean, var, partial, sums, dx, dw, db,
-                                                            batch, channels, chunks, eps, training != 0, relu != 0);
+    if (dx) {
+        const dim3 grid((channels + 31) / 32, (batch + flash_native::ApplyRows - 1) / flash_native::ApplyRows);
+        flash_native::bn_backward_apply<<<grid, 256, 0, st>>>(x, dy, y, w, mean, var, sums, dx,
+                                                            batch, channels, eps, training != 0, relu != 0);
     }
     return flash_native::launched("Run FlashSAC BatchNorm backward");
 }
