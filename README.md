@@ -114,6 +114,8 @@ uses cuBLASLt matrix products plus original CUDA bias-gradient and multi-tensor
 Adam kernels, persistent Warp-owned arrays, and CUDA graph capture. It does not
 depend on Torch. CUDA development tools are required when first building it.
 This is experimental; inspect the numerical and timing results before adopting it.
+The [upstream learner comparison](docs/cuda.md#comparison-with-upstream-learners-23-october-2026)
+measures actual RSL-RL PPO and official FlashSAC alongside RoboLearn's backends.
 
 ## Credits
 

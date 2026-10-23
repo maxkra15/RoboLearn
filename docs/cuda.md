@@ -164,6 +164,75 @@ No environment was trained or evaluated in this experiment. The backend remains
 experimental; full policy learning checks and profiling of the remaining
 normalization/reduction work are needed before recommending it for training.
 
+### Comparison with upstream learners, 23 October 2026
+
+The following experiment executes **RSL-RL 5.5.1's actual PyTorch PPO**, the
+authors' unmodified FlashSAC agent, RoboLearn's Torch FlashSAC port, and the native
+CUDA backend. Source: [`8611ba5`](https://github.com/maxkra15/RoboLearn/commit/8611ba548644a4ee55482551f6fe4f327cf5d618).
+It uses one L40, with the runtime versions and G1-shaped networks described above.
+Values are medians of three synchronized block means; setup and compilation are
+excluded. Each recipe runs its rows and blocks in one ordered process, with
+shared compiler caches, rather than independent runs or confidence intervals.
+
+| PPO implementation | Precision | Milliseconds per full update |
+| --- | --- | ---: |
+| RSL-RL, Isaac Lab default recipe | FP32, TF32 allowed | 73.636 |
+| RSL-RL, eager control | Strict FP32 | 73.221 |
+| RSL-RL, official actor/critic compile | Strict FP32 | 81.920 |
+| RSL-RL, official compile and autocast | BF16, FP32 parameters/Adam | 89.826 |
+| RoboLearn, captured native CUDA | Strict FP32 | 31.925 |
+
+Each PPO call includes final critic bootstrap, GAE, advantage normalization,
+shuffle, and all 20 minibatch optimizer steps. Each block restores common initial
+weights and empty Adam state, then runs five warm and 50 timed calls: **3,000
+measured optimizer steps per parameter per backend** across three blocks. The
+native path took 0.434 times the default RSL time, a **2.31x speedup** in this
+synthetic learner experiment.
+
+This comparison includes the implementations' control and metric costs. Stock
+RSL retains Python adaptive-KL decisions and per-minibatch scalar reads; the
+native path captures the full update and reads health metrics once per call.
+RSL reports mean minibatch losses, while native health describes the last
+minibatch. These costs and reporting semantics differ. The result cannot be
+attributed solely to dense matrix arithmetic.
+
+| FlashSAC implementation | FP32 control, ms/call | Compiled AMP recipe, ms/call |
+| --- | ---: | ---: |
+| Official FlashSAC | 11.751 | 3.892 |
+| RoboLearn Torch port | 11.578 | 4.144 |
+| RoboLearn native CUDA, strict FP32 in both processes | 12.976 | 12.986 |
+
+One FlashSAC call samples replay and updates the critic; actor and temperature
+update every second call. These units differ from PPO. Each row completed **300
+critic, 150 actor and 150 temperature updates**, with zero skipped steps, across
+three continuous-state blocks. All implementations used common initial weights,
+matching replay data and the same host scalar metric cadence. Their random
+streams and updated trajectories differ.
+
+Torch TF32 is disabled in the FP32 control. The AMP recipe allows TF32 and uses
+compiled FP16 autocast for the official and Torch-port learners; native CUDA
+continues to use pedantic FP32. Native FP32 was slower than official FP32, and
+the official AMP recipe was fastest. The Torch port took about **6.5% longer**
+than official AMP. The official agent unconditionally compiles categorical-target
+and reward-normalization helpers that the port currently leaves uncompiled; this
+experiment does not isolate the contribution of that difference. Official AMP's
+first warmup took 416 seconds including compilation/autotuning. Subsequent rows
+reuse caches, so startup costs are not independently cold measurements.
+
+All rows passed finite-metric and updated-weight checks. PPO passed exact
+checkpoint restoration and a post-load update; FlashSAC checkpoints were saved
+in each backend's native format, with no reload check in this experiment.
+Initial native/RSL bootstrap and GAE alignment was checked before optimization.
+No task learning, policy quality, or end-to-end simulator speed was measured.
+
+Reproduce using [the RSL comparison](../examples/benchmark_rsl_ppo_cuda.py) and
+[the official FlashSAC comparison](../examples/benchmark_official_flashsac.py).
+FlashSAC source is pinned to
+[`87edc90`](https://github.com/Holiday-Robot/FlashSAC/tree/87edc9061150ae9e962dd84e6544e27a1554b3ab)
+and verified before import, without source patches or runtime monkeypatches.
+Its declared Python range excludes Python 3.12: execution here on Python 3.12.14
+and Torch 2.11 is a current-runtime experiment, outside that declared matrix.
+
 The native CUDA code is original RoboLearn code. Algorithm authors and upstream
 FlashSAC attribution remain in [ATTRIBUTION.md](../ATTRIBUTION.md) and
 [CITATIONS.bib](../CITATIONS.bib). Warp-NN and NVIDIA CUDA libraries retain their
