@@ -11,6 +11,8 @@
 //     input_dtype=0: old FP32; 1: FP16 A/B, FP32 accumulation/C/D/bias.
 // int rl_cast_f32_f16(const void* source, void* destination, size_t count, void* stream);
 // size_t rl_plan_workspace(void* plan);  // SIZE_MAX on error
+// int rl_plan_autotune(void* plan, float beta, void* stream);  // scratch-only, before capture
+// const char* rl_plan_tuning_metadata(void* plan);  // plan-owned JSON, read-only
 // int rl_plan_run(void* plan, const void* A, const void* B, const void* C,
 //                 void* D, const void* bias, void* workspace,
 //                 size_t workspace_bytes, float beta, void* stream);
@@ -50,13 +52,17 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <iomanip>
 #include <limits>
 #include <memory>
+#include <sstream>
+#include <string>
 #include <vector>
 
 namespace {
@@ -98,6 +104,18 @@ bool aligned(const void* pointer, std::size_t bytes) noexcept {
 }
 
 struct DensePlan {
+    struct Candidate {
+        cublasLtMatmulHeuristicResult_t heuristic{};
+        int heuristic_index = 0;
+        int algorithm_id = -1;
+        int tile_id = -1;
+        int split_k = -1;
+        int stages_id = -1;
+        int metadata_status = 0;
+        cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
+        std::vector<float> samples_ms;
+    };
+
     cublasLtHandle_t handle = nullptr;
     cublasLtMatmulDesc_t operation = nullptr;
     cublasLtMatrixLayout_t a = nullptr;
@@ -108,6 +126,12 @@ struct DensePlan {
     std::size_t workspace_bytes = 0;
     bool bias = false;
     std::size_t input_alignment = alignof(float);
+    std::size_t a_bytes = 0, b_bytes = 0, output_bytes = 0, bias_bytes = 0;
+    std::vector<Candidate> candidates;
+    int selected_candidate = 0;
+    bool tuned = false;
+    bool used = false;
+    std::string tuning_metadata;
 
     int close(bool report = false) noexcept {
         int result = 0;
@@ -133,6 +157,78 @@ struct DensePlan {
     }
 
     ~DensePlan() noexcept { close(); }
+};
+
+constexpr int kTuneBatches = 3;
+constexpr int kTuneIterations = 8;
+constexpr int kTuneWarmup = 2;
+constexpr double kTuneMinimumGain = 0.03;
+
+float median_sample(const std::vector<float>& values) {
+    std::vector<float> sorted(values);
+    std::sort(sorted.begin(), sorted.end());
+    return sorted[sorted.size() / 2];
+}
+
+void describe_tuning(DensePlan& plan, float beta) {
+    std::ostringstream json;
+    json << std::setprecision(9)
+         << "{\"enabled\":" << (plan.tuned ? "true" : "false")
+         << ",\"tuned_beta\":";
+    if (plan.tuned) json << beta;
+    else json << "null";
+    json << ",\"default_candidate_index\":0,\"selected_candidate_index\":" << plan.selected_candidate
+         << ",\"selected_workspace_bytes\":" << plan.workspace_bytes
+         << ",\"minimum_gain_fraction\":" << kTuneMinimumGain
+         << ",\"timing_batches\":" << kTuneBatches
+         << ",\"iterations_per_batch\":" << kTuneIterations
+         << ",\"warmup_calls\":" << kTuneWarmup
+         << ",\"scratch_fixture\":\"zero-filled private buffers; C aliases D\""
+         << ",\"selection_rule\":\"median improvement >=3% and >=3% improvement in at least two paired batches; otherwise original first valid heuristic\""
+         << ",\"candidates\":[";
+    for (std::size_t i = 0; i < plan.candidates.size(); ++i) {
+        const auto& candidate = plan.candidates[i];
+        if (i) json << ',';
+        json << "{\"heuristic_index\":" << candidate.heuristic_index
+             << ",\"algorithm_id\":" << candidate.algorithm_id
+             << ",\"tile_id\":" << candidate.tile_id
+             << ",\"split_k\":" << candidate.split_k
+             << ",\"stages_id\":" << candidate.stages_id
+             << ",\"metadata_status\":" << candidate.metadata_status
+             << ",\"workspace_bytes\":" << candidate.heuristic.workspaceSize
+             << ",\"status\":" << static_cast<int>(candidate.status)
+             << ",\"samples_ms\":[";
+        for (std::size_t j = 0; j < candidate.samples_ms.size(); ++j) {
+            if (j) json << ',';
+            json << candidate.samples_ms[j];
+        }
+        json << "],\"median_ms\":";
+        if (candidate.samples_ms.empty()) json << "null";
+        else json << median_sample(candidate.samples_ms);
+        json << '}';
+    }
+    json << "]}";
+    plan.tuning_metadata = json.str();
+}
+
+struct TuningScratch {
+    void* a = nullptr;
+    void* b = nullptr;
+    void* output = nullptr;
+    void* bias = nullptr;
+    void* workspace = nullptr;
+    cudaEvent_t begin = nullptr;
+    cudaEvent_t end = nullptr;
+
+    ~TuningScratch() noexcept {
+        if (begin) cudaEventDestroy(begin);
+        if (end) cudaEventDestroy(end);
+        if (workspace) cudaFree(workspace);
+        if (bias) cudaFree(bias);
+        if (output) cudaFree(output);
+        if (b) cudaFree(b);
+        if (a) cudaFree(a);
+    }
 };
 
 constexpr unsigned kThreads = 256;
@@ -331,6 +427,17 @@ static void* create_dense_plan(
         auto plan = std::make_unique<DensePlan>();
         plan->bias = use_bias != 0;
         plan->input_alignment = input_dtype == 1 ? 16 : alignof(float);
+        const auto matrix_bytes = [](int leading, int columns, std::size_t itemsize) {
+            const std::size_t elements = static_cast<std::size_t>(leading) * static_cast<std::size_t>(columns);
+            require(elements <= std::numeric_limits<std::size_t>::max() / itemsize,
+                    "Dense scratch matrix byte count overflows.");
+            return elements * itemsize;
+        };
+        const std::size_t itemsize = input_dtype == 1 ? sizeof(__half) : sizeof(float);
+        plan->a_bytes = matrix_bytes(lda, a_columns, itemsize);
+        plan->b_bytes = matrix_bytes(ldb, b_columns, itemsize);
+        plan->output_bytes = matrix_bytes(ldd, n, sizeof(float));
+        plan->bias_bytes = static_cast<std::size_t>(m) * sizeof(float);
         check_blas(cublasLtCreate(&plan->handle), "Create cuBLASLt handle");
         const cublasComputeType_t compute = input_dtype == 1 ? CUBLAS_COMPUTE_32F
             : (allow_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F_PEDANTIC);
@@ -379,16 +486,36 @@ static void* create_dense_plan(
         check_blas(cublasLtMatmulAlgoGetHeuristic(
             plan->handle, plan->operation, plan->a, plan->b, plan->output, plan->output,
             plan->preference, 8, candidates, &returned), "Select matmul algorithm");
-        bool found = false;
         for (int i = 0; i < returned; ++i) {
             if (candidates[i].state == CUBLAS_STATUS_SUCCESS && candidates[i].workspaceSize <= workspace_limit) {
-                plan->algorithm = candidates[i].algo;
-                plan->workspace_bytes = candidates[i].workspaceSize;
-                found = true;
-                break;
+                DensePlan::Candidate candidate;
+                candidate.heuristic = candidates[i];
+                candidate.heuristic_index = i;
+                for (const auto field : {
+                    std::make_pair(CUBLASLT_ALGO_CONFIG_ID, &candidate.algorithm_id),
+                    std::make_pair(CUBLASLT_ALGO_CONFIG_TILE_ID, &candidate.tile_id),
+                    std::make_pair(CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &candidate.split_k),
+                    std::make_pair(CUBLASLT_ALGO_CONFIG_STAGES_ID, &candidate.stages_id)}) {
+                    std::size_t written = 0;
+                    const cublasStatus_t status = cublasLtMatmulAlgoConfigGetAttribute(
+                        &candidate.heuristic.algo, field.first, field.second, sizeof(int), &written);
+                    // Optional descriptions must never reject a valid heuristic,
+                    // including the untuned default, on another CUDA version.
+                    if (status != CUBLAS_STATUS_SUCCESS || written != sizeof(int)) {
+                        *field.second = -1;
+                        if (!candidate.metadata_status) candidate.metadata_status = static_cast<int>(
+                            status == CUBLAS_STATUS_SUCCESS ? CUBLAS_STATUS_INTERNAL_ERROR : status);
+                    }
+                }
+                plan->candidates.push_back(candidate);
             }
         }
-        require(found, "No cuBLASLt algorithm supports this shape, precision and workspace limit.");
+        require(!plan->candidates.empty(), "No cuBLASLt algorithm supports this shape, precision and workspace limit.");
+        // Preserve the exact original first-valid-heuristic default until tuning
+        // is explicitly requested outside capture.
+        plan->algorithm = plan->candidates[0].heuristic.algo;
+        plan->workspace_bytes = plan->candidates[0].heuristic.workspaceSize;
+        describe_tuning(*plan, 0.0f);
         return plan.release();
     } catch (const Failure&) {
         return nullptr;
@@ -408,6 +535,129 @@ extern "C" void* rl_plan_create_mixed(
     int m, int n, int k, int transa, int transb, int lda, int ldb, int ldd,
     int use_bias, int allow_tf32, int input_dtype, std::size_t workspace_limit) noexcept {
     return create_dense_plan(m, n, k, transa, transb, lda, ldb, ldd, use_bias, allow_tf32, input_dtype, workspace_limit);
+}
+
+extern "C" int rl_plan_autotune(void* opaque, float beta, void* stream) noexcept {
+    last_error[0] = '\0';
+    try {
+        require(opaque && (beta == 0.0f || beta == 1.0f), "Autotuning requires a plan and beta=0 or beta=1.");
+        auto* plan = static_cast<DensePlan*>(opaque);
+        require(!plan->tuned && !plan->used, "Dense plans may be autotuned only once, before use/capture.");
+        const cudaStream_t st = reinterpret_cast<cudaStream_t>(stream);
+        cudaStreamCaptureStatus capture;
+        check_cuda(cudaStreamIsCapturing(st, &capture), "Inspect autotuning stream capture");
+        require(capture == cudaStreamCaptureStatusNone, "Autotuning cannot run inside graph capture.");
+
+        // Only these private buffers are read/written by candidate probes. Real
+        // parameters, adjoints, model outputs and RNG state are never supplied.
+        TuningScratch scratch;
+        const auto allocate_zero = [&](void** pointer, std::size_t bytes) {
+            check_cuda(cudaMalloc(pointer, bytes), "Allocate autotuning scratch");
+            check_cuda(cudaMemsetAsync(*pointer, 0, bytes, st), "Initialize autotuning scratch");
+        };
+        allocate_zero(&scratch.a, plan->a_bytes);
+        allocate_zero(&scratch.b, plan->b_bytes);
+        allocate_zero(&scratch.output, plan->output_bytes);
+        if (plan->bias) {
+            allocate_zero(&scratch.bias, plan->bias_bytes);
+            const void* bias = scratch.bias;
+            check_blas(cublasLtMatmulDescSetAttribute(
+                plan->operation, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)), "Set autotuning bias");
+        }
+        std::size_t workspace_bytes = 0;
+        for (const auto& candidate : plan->candidates) {
+            workspace_bytes = std::max(workspace_bytes, candidate.heuristic.workspaceSize);
+        }
+        if (workspace_bytes) allocate_zero(&scratch.workspace, workspace_bytes);
+        check_cuda(cudaEventCreate(&scratch.begin), "Create autotuning start event");
+        check_cuda(cudaEventCreate(&scratch.end), "Create autotuning stop event");
+
+        const float alpha = 1.0f;
+        const auto launch = [&](const DensePlan::Candidate& candidate) {
+            return cublasLtMatmul(
+                plan->handle, plan->operation, &alpha, scratch.a, plan->a, scratch.b, plan->b,
+                &beta, scratch.output, plan->output, scratch.output, plan->output,
+                &candidate.heuristic.algo, scratch.workspace, candidate.heuristic.workspaceSize, st);
+        };
+        for (auto& candidate : plan->candidates) {
+            for (int iteration = 0; iteration < kTuneWarmup; ++iteration) {
+                candidate.status = launch(candidate);
+                if (candidate.status != CUBLAS_STATUS_SUCCESS) break;
+            }
+            // Asynchronous device faults are fatal; an unsupported alternative
+            // reported synchronously by cuBLAS is merely recorded and excluded.
+            check_cuda(cudaStreamSynchronize(st), "Warm autotuning candidate");
+        }
+        check_blas(plan->candidates[0].status, "Warm original matmul algorithm");
+
+        const int count = static_cast<int>(plan->candidates.size());
+        for (int batch = 0; batch < kTuneBatches; ++batch) {
+            for (int offset = 0; offset < count; ++offset) {
+                // Rotate order so one candidate is not always the first probe.
+                auto& candidate = plan->candidates[(offset + batch) % count];
+                if (candidate.status != CUBLAS_STATUS_SUCCESS) continue;
+                check_cuda(cudaMemsetAsync(scratch.output, 0, plan->output_bytes, st), "Reset autotuning output");
+                check_cuda(cudaEventRecord(scratch.begin, st), "Start autotuning timing batch");
+                for (int iteration = 0; iteration < kTuneIterations; ++iteration) {
+                    candidate.status = launch(candidate);
+                    if (candidate.status != CUBLAS_STATUS_SUCCESS) break;
+                }
+                check_cuda(cudaEventRecord(scratch.end, st), "Stop autotuning timing batch");
+                check_cuda(cudaEventSynchronize(scratch.end), "Finish autotuning timing batch");
+                if (candidate.status != CUBLAS_STATUS_SUCCESS) continue;
+                float elapsed = 0.0f;
+                check_cuda(cudaEventElapsedTime(&elapsed, scratch.begin, scratch.end), "Read autotuning timing batch");
+                elapsed /= static_cast<float>(kTuneIterations);
+                require(std::isfinite(elapsed) && elapsed > 0.0f, "Autotuning returned an invalid CUDA event time.");
+                candidate.samples_ms.push_back(elapsed);
+            }
+        }
+        const auto& original = plan->candidates[0];
+        check_blas(original.status, "Measure original matmul algorithm");
+        require(original.samples_ms.size() == kTuneBatches, "Original matmul algorithm has incomplete timing samples.");
+        float best_time = median_sample(original.samples_ms);
+        int selected = 0;
+        for (int index = 1; index < count; ++index) {
+            const auto& candidate = plan->candidates[index];
+            if (candidate.status != CUBLAS_STATUS_SUCCESS || candidate.samples_ms.size() != kTuneBatches) continue;
+            const float time = median_sample(candidate.samples_ms);
+            int wins = 0;
+            for (int batch = 0; batch < kTuneBatches; ++batch) {
+                wins += candidate.samples_ms[batch] <= original.samples_ms[batch] * (1.0f - kTuneMinimumGain);
+            }
+            if (time < best_time && time <= median_sample(original.samples_ms) * (1.0f - kTuneMinimumGain) && wins >= 2) {
+                selected = index;
+                best_time = time;
+            }
+        }
+        if (plan->bias) {
+            const void* hint = reinterpret_cast<const void*>(alignof(float));
+            check_blas(cublasLtMatmulDescSetAttribute(
+                plan->operation, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &hint, sizeof(hint)), "Restore dense bias hint");
+        }
+        // Commit only after successful measurement. No later run changes the
+        // selected algorithm or workspace; graph capture uses this frozen plan.
+        plan->algorithm = plan->candidates[selected].heuristic.algo;
+        plan->workspace_bytes = plan->candidates[selected].heuristic.workspaceSize;
+        plan->selected_candidate = selected;
+        plan->tuned = true;
+        describe_tuning(*plan, beta);
+        return 0;
+    } catch (const Failure&) {
+        return -1;
+    } catch (...) {
+        set_error("Unexpected host error while autotuning dense plan.");
+        return -1;
+    }
+}
+
+extern "C" const char* rl_plan_tuning_metadata(void* opaque) noexcept {
+    last_error[0] = '\0';
+    if (!opaque) {
+        set_error("Dense plan is null.");
+        return nullptr;
+    }
+    return static_cast<DensePlan*>(opaque)->tuning_metadata.c_str();
 }
 
 extern "C" int rl_cast_f32_f16(const void* source, void* destination, std::size_t count, void* stream) noexcept {
@@ -466,6 +716,7 @@ extern "C" int rl_plan_run(
                 plan->operation, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)), "Set runtime bias");
         }
         const float alpha = 1.0f;
+        plan->used = true;
         check_blas(cublasLtMatmul(
             plan->handle, plan->operation, &alpha, a, plan->a, b, plan->b,
             &beta, c ? c : d, plan->output, d, plan->output, &plan->algorithm,

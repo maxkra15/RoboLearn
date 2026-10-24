@@ -172,7 +172,39 @@ def backward(module, source, cotangent):
     return output
 
 
-def dense(report, rng):
+def tuning_controls(report, label, metadata, enabled):
+    operations = [operation for shape in metadata.values() for operation in shape["operations"].values()]
+    valid = bool(operations)
+    replacements = 0
+    for operation in operations:
+        candidates = operation["candidates"]
+        selected = operation["selected_candidate_index"]
+        valid &= (
+            operation["enabled"] == enabled
+            and 0 < len(candidates) <= 8
+            and operation["default_candidate_index"] == 0
+            and 0 <= selected < len(candidates)
+        )
+        if not 0 <= selected < len(candidates):
+            continue
+        chosen, original = candidates[selected], candidates[0]
+        valid &= chosen["status"] == 0 and operation["selected_workspace_bytes"] == chosen["workspace_bytes"]
+        if enabled:
+            valid &= operation["tuned_beta"] == operation["beta"]
+            for candidate in (chosen, original):
+                samples = candidate["samples_ms"]
+                valid &= len(samples) == 3 and all(np.isfinite(value) and value > 0 for value in samples)
+            if selected:
+                replacements += 1
+                limit = 1 - operation["minimum_gain_fraction"]
+                valid &= chosen["median_ms"] <= limit * original["median_ms"] + 1e-9
+                valid &= sum(a <= limit * b + 1e-9 for a, b in zip(chosen["samples_ms"], original["samples_ms"])) >= 2
+        else:
+            valid &= selected == 0 and all(not candidate["samples_ms"] for candidate in candidates)
+    report.check(f"{label}/prepared_tuning_controls", valid, plans=len(operations), replacements=replacements)
+
+
+def dense(report, rng, *, autotune=False):
     from robolearn.cuda import CudaLinear
 
     x = rng.normal(0, 0.3, (17, 19)).astype(np.float32)
@@ -181,10 +213,18 @@ def dense(report, rng):
     dy = rng.normal(0, 0.2, (17, 23)).astype(np.float32)
     source = wp.array(x, requires_grad=True)
     cotangent = wp.array(dy)
-    layer = CudaLinear(19, 23, initialize_parameters=False, compute_dtype="float16")
+    layer = CudaLinear(19, 23, initialize_parameters=False, compute_dtype="float16", autotune=autotune)
     layer.weight.data.assign(w)
     layer.bias.data.assign(b[:, None])
+    owned = {"input": source, "weight": layer.weight.data, "bias": layer.bias.data}
+    for value in tuple(owned.values()):
+        value.grad.zero_()
+    owned.update({f"{name}_grad": value.grad for name, value in tuple(owned.items())})
+    before_prepare = snapshot(owned)
     layer.prepare(17).prepare(17, "float32")
+    for name, value in snapshot(owned).items():
+        report.arrays(f"prepare_preserves/{name}", value, before_prepare[name], exact=True)
+    plan_choices = json.dumps(layer.tuning_metadata, sort_keys=True)
     x16, w16, dy16 = [value.astype(np.float16).astype(np.float64) for value in (x, w, dy)]
     references = {"output": x16 @ w16.T + b, "dx": dy16 @ w16, "dw": dy16.T @ x16, "db": dy.sum(0)[:, None]}
     xf, wf, dyf = [value.astype(np.float32) for value in (x16, w16, dy16)]
@@ -208,6 +248,7 @@ def dense(report, rng):
         output = run()
     wp.capture_launch(capture.graph)
     captured = state(output)
+    report.check("prepared_plan_choices_retained", json.dumps(layer.tuning_metadata, sort_keys=True) == plan_choices)
     for name in references:
         report.arrays(f"mixed/{name}", eager[name], references[name], atol=2e-5, rtol=2e-5)
         report.arrays(f"mixed_fp32_reference/{name}", eager[name], fp32_references[name], atol=2e-5, rtol=2e-5)
@@ -241,8 +282,10 @@ def dense(report, rng):
     wp.capture_launch(refreshed.graph)
     report.arrays("managed_shadow/capture", refreshed_output.numpy(), expected_output)
     report.arrays("managed_shadow/rounding", shadow.numpy(), updated_weight.astype(np.float16), exact=True)
+    tuning_controls(report, "dense", layer.tuning_metadata, autotune)
+    report.current.update(cuda_autotune=autotune, cuda_tuning_metadata=layer.tuning_metadata)
     np.savez(
-        report.artifacts / "dense.npz",
+        report.artifacts / ("dense-autotuned.npz" if autotune else "dense.npz"),
         **{f"eager_{k}": v for k, v in eager.items()},
         **{f"fp32_reference_{k}": v for k, v in fp32_references.items()},
         **references,
@@ -605,7 +648,7 @@ def learner_controls(report, label, agent, scheduled):
         report.check(f"{label}/{name}/actual_progress", actual > 0, completed_updates=actual)
 
 
-def flash_recipe(report, rng, *, amp, fused, g1=False, updates=8, batch_size=32):
+def flash_recipe(report, rng, *, amp, fused, g1=False, updates=8, batch_size=32, cuda_autotune=False):
     from robolearn.flashsac import FlashSACConfig
     from robolearn.warp import WarpFlashSAC
 
@@ -626,11 +669,21 @@ def flash_recipe(report, rng, *, amp, fused, g1=False, updates=8, batch_size=32)
         buffer_min_length=num_envs,
     )
     agents = [
-        WarpFlashSAC(observation_dim, action_dim, num_envs, cfg, dense_backend="cuda", fused_updates=fused)
+        WarpFlashSAC(
+            observation_dim,
+            action_dim,
+            num_envs,
+            cfg,
+            dense_backend="cuda",
+            fused_updates=fused,
+            cuda_autotune=cuda_autotune,
+        )
         for _ in range(2)
     ]
     eager, captured = agents
     label = f"{'g1' if g1 else 'small'}-amp{int(amp)}-fused{int(fused)}"
+    if cuda_autotune:
+        label += "-autotuned"
     for _ in range(cfg.n_step + 2):
         observation = wp.array(rng.normal(0, 0.3, (num_envs, observation_dim)).astype(np.float32))
         actions = wp.array(rng.uniform(-0.3, 0.3, (num_envs, action_dim)).astype(np.float32))
@@ -639,6 +692,7 @@ def flash_recipe(report, rng, *, amp, fused, g1=False, updates=8, batch_size=32)
         eager.observe(observation, actions, reward, flags, flags, observation)
     for agent in agents:
         agent.prepare(capture=False)
+    prepared_choices = [json.dumps(agent.cuda_tuning_metadata(), sort_keys=True) for agent in agents]
     initial = eager.state_dict(include_replay=True)
     captured.load_state_dict(initial)
     fixed = {
@@ -774,9 +828,17 @@ def flash_recipe(report, rng, *, amp, fused, g1=False, updates=8, batch_size=32)
         report.current["gradient_zero_plans"] = plans
     else:
         report.check(f"{label}/ordinary_clear", all(not agent._zero_plans for agent in agents))
+    tuning = {}
+    for name, agent, choices in zip(("eager", "captured"), agents, prepared_choices, strict=True):
+        tuning[name] = agent.cuda_tuning_metadata()
+        report.check(f"{label}/{name}/prepared_choices_retained", json.dumps(tuning[name], sort_keys=True) == choices)
+        for layer, metadata in tuning[name].items():
+            tuning_controls(report, f"{label}/{name}/{layer}", metadata, cuda_autotune)
     report.current.update(
         amp=amp,
         fused=fused,
+        cuda_autotune=cuda_autotune,
+        cuda_tuning_metadata=tuning,
         batch_size=batch_size,
         observation_dim=observation_dim,
         action_dim=action_dim,
@@ -807,6 +869,7 @@ def main():
         with wp.ScopedDevice(device):
             for name, function in (
                 ("dense", dense),
+                ("dense-autotuned", lambda report, rng: dense(report, rng, autotune=True)),
                 ("scaler", scaler),
                 ("grouped-zero", grouped_zero),
                 ("projection-ema", projection_ema),
@@ -821,16 +884,18 @@ def main():
                     with report.stage(f"small-amp{int(amp)}-fused{int(fused)}"):
                         flash_recipe(report, rng, amp=amp, fused=fused)
             if not args.skip_g1:
-                with report.stage("g1-shaped-amp-fused"):
-                    flash_recipe(
-                        report,
-                        rng,
-                        amp=True,
-                        fused=True,
-                        g1=True,
-                        updates=args.g1_updates,
-                        batch_size=args.g1_batch_size,
-                    )
+                for autotune in (False, True):
+                    with report.stage("g1-shaped-amp-fused" + ("-autotuned" if autotune else "")):
+                        flash_recipe(
+                            report,
+                            rng,
+                            amp=True,
+                            fused=True,
+                            g1=True,
+                            updates=args.g1_updates,
+                            batch_size=args.g1_batch_size,
+                            cuda_autotune=autotune,
+                        )
         report.data["status"] = "passed"
     except BaseException:
         report.data.update(status="failed", traceback=traceback.format_exc())

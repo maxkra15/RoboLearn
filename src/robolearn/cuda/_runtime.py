@@ -88,6 +88,10 @@ def _declare(library):
     library.rl_cast_f32_f16.restype = integer
     library.rl_plan_workspace.argtypes = [pointer]
     library.rl_plan_workspace.restype = size
+    library.rl_plan_autotune.argtypes = [pointer, ctypes.c_float, pointer]
+    library.rl_plan_autotune.restype = integer
+    library.rl_plan_tuning_metadata.argtypes = [pointer]
+    library.rl_plan_tuning_metadata.restype = ctypes.c_char_p
     library.rl_plan_destroy.argtypes = [pointer]
     library.rl_plan_destroy.restype = integer
     library.rl_plan_run.argtypes = [pointer] * 7 + [size, ctypes.c_float, pointer]

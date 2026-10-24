@@ -341,12 +341,13 @@ class WarpFlashSAC:
         optimized_linear_backward: bool = True,
         dense_backend: str = "warp",
         fused_updates: bool = False,
+        cuda_autotune: bool = False,
     ):
         if dense_backend not in ("warp", "cuda"):
             raise ValueError("dense_backend must be 'warp' or 'cuda'.")
         cfg = cfg or FlashSACConfig()
-        if (cfg.use_amp or fused_updates) and dense_backend != "cuda":
-            raise ValueError("Mixed precision and fused updates require dense_backend='cuda'.")
+        if (cfg.use_amp or fused_updates or cuda_autotune) and dense_backend != "cuda":
+            raise ValueError("Mixed precision, fused updates and CUDA plan tuning require dense_backend='cuda'.")
         if min(observation_dim, action_dim, num_envs) < 1:
             raise ValueError("Observation, action and environment dimensions must be positive.")
         total_dim = critic_observation_dim or observation_dim
@@ -376,6 +377,7 @@ class WarpFlashSAC:
         self.optimized_linear_backward = optimized_linear_backward
         self.dense_backend = dense_backend
         self.fused_updates = fused_updates
+        self.cuda_autotune = bool(cuda_autotune)
         self.compute_dtype = "float16" if cfg.use_amp else "float32"
         self._update_step = 0
         self._prepared = False
@@ -396,6 +398,7 @@ class WarpFlashSAC:
                 dense_backend=dense_backend,
                 compute_dtype=self.compute_dtype,
                 fused_updates=fused_updates,
+                cuda_autotune=self.cuda_autotune,
             )
             critic_args = (
                 total_dim,
@@ -414,6 +417,7 @@ class WarpFlashSAC:
                 dense_backend=dense_backend,
                 compute_dtype=self.compute_dtype,
                 fused_updates=fused_updates,
+                cuda_autotune=self.cuda_autotune,
             )
             self.target_critic = FlashDoubleCritic(
                 *critic_args,
@@ -423,6 +427,7 @@ class WarpFlashSAC:
                 dense_backend=dense_backend,
                 compute_dtype=self.compute_dtype,
                 fused_updates=fused_updates,
+                cuda_autotune=self.cuda_autotune,
                 requires_grad=False,
             )
             self.target_critic.load_state_dict(self.critic.state_dict())
@@ -1075,6 +1080,20 @@ class WarpFlashSAC:
         self._update_step = int(np.asarray(state["update_counters"])[0])
         self._clear_gradients()
 
+    def cuda_tuning_metadata(self) -> dict:
+        """Return host-side prepared dense-plan choices without synchronizing CUDA."""
+        if self.dense_backend != "cuda":
+            return {}
+        from robolearn.cuda import CudaLinear
+
+        result = {}
+        for label, network in (("actor", self.actor), ("critic", self.critic), ("target_critic", self.target_critic)):
+            names = {id(parameter): name for name, parameter in network.named_parameters()}
+            for module in network._all_modules():
+                if isinstance(module, CudaLinear):
+                    result[f"{label}.{names[id(module.weight)]}"] = module.tuning_metadata
+        return result
+
     def save(self, path: str | Path, *, include_replay: bool = False) -> None:
         """Save a NumPy/JSON checkpoint; omitted replay is explicitly reset on load."""
         directory = Path(path)
@@ -1090,6 +1109,7 @@ class WarpFlashSAC:
             "optimized_linear_backward": self.optimized_linear_backward,
             "dense_backend": self.dense_backend,
             "fused_updates": self.fused_updates,
+            "cuda_autotune": self.cuda_autotune,
             "replay_included": include_replay,
         }
         state = self.state_dict(include_replay=include_replay)

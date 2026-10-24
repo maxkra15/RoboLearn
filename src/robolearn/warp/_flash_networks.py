@@ -22,13 +22,17 @@ from ._flash_normalization import BatchNorm, LogSoftmax, RMSNorm
 from ._linear import TiledLinear
 
 
-def _linear_type(dense_backend: str, optimized_linear_backward: bool, compute_dtype: str = "float32"):
+def _linear_type(
+    dense_backend: str, optimized_linear_backward: bool, compute_dtype: str = "float32", cuda_autotune: bool = False
+):
     if dense_backend == "cuda":
         from robolearn.cuda import CudaLinear
 
-        return partial(CudaLinear, compute_dtype=compute_dtype)
+        return partial(CudaLinear, compute_dtype=compute_dtype, autotune=cuda_autotune)
     if dense_backend != "warp":
         raise ValueError("dense_backend must be 'warp' or 'cuda'.")
+    if cuda_autotune:
+        raise ValueError("CUDA plan tuning requires dense_backend='cuda'.")
     return TiledLinear if optimized_linear_backward else nn.Linear
 
 
@@ -410,8 +414,9 @@ class FlashActor(_Backbone):
         dense_backend: str = "warp",
         compute_dtype: str = "float32",
         fused_updates: bool = False,
+        cuda_autotune: bool = False,
     ):
-        linear = _linear_type(dense_backend, optimized_linear_backward, compute_dtype)
+        linear = _linear_type(dense_backend, optimized_linear_backward, compute_dtype, cuda_autotune)
         if min(observation_dim, action_dim, hidden_dim) <= 0 or num_blocks < 0:
             raise ValueError("Network dimensions must be positive and block count nonnegative.")
         with wp.ScopedDevice(device):
@@ -513,8 +518,9 @@ class FlashDoubleCritic(_FlashNetwork):
         dense_backend: str = "warp",
         compute_dtype: str = "float32",
         fused_updates: bool = False,
+        cuda_autotune: bool = False,
     ):
-        linear = _linear_type(dense_backend, optimized_linear_backward, compute_dtype)
+        linear = _linear_type(dense_backend, optimized_linear_backward, compute_dtype, cuda_autotune)
         if min(observation_dim, action_dim, hidden_dim) <= 0 or num_blocks < 0 or num_bins < 2 or min_v >= max_v:
             raise ValueError("Invalid categorical critic dimensions or support.")
         with wp.ScopedDevice(device):

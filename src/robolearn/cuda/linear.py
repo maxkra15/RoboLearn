@@ -5,7 +5,10 @@
 from __future__ import annotations
 
 import ctypes
+import json
+import time
 from contextlib import contextmanager
+from copy import deepcopy
 
 import warp as wp
 from warp_nn import nn
@@ -28,6 +31,7 @@ class CudaLinear(nn.Linear):
         allow_tf32: bool = False,
         workspace_limit: int = 32 * 1024 * 1024,
         compute_dtype: str = "float32",
+        autotune: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -38,10 +42,23 @@ class CudaLinear(nn.Linear):
         self.allow_tf32 = allow_tf32
         self.workspace_limit = workspace_limit
         self.compute_dtype = compute_dtype
+        self.autotune = bool(autotune)
         self._cuda_plans = {}
+        self._tuning_metadata = {}
         self._weight_shadow = None
         self._shadow_library = None
         self._weight_shadow_managed = False
+
+    @property
+    def tuning_metadata(self):
+        """Return host-only algorithm/probe records for every prepared shape/mode.
+
+        String keys and values are JSON serializable. Candidate timings are
+        scratch CUDA-event measurements, not full learner latency. With tuning
+        disabled the selected algorithm is the original first valid heuristic.
+        This property neither prepares operations nor accesses device values.
+        """
+        return deepcopy(self._tuning_metadata)
 
     @property
     def compute_dtype(self):
@@ -136,7 +153,13 @@ class CudaLinear(nn.Linear):
             self.compute_dtype = previous
 
     def prepare(self, batch_size: int, compute_dtype: str | None = None):
-        """Create GEMM plans, workspace and optional conversion arrays outside capture."""
+        """Prepare immutable GEMM choices and optional conversion arrays outside capture.
+
+        Opt-in autotuning probes only private native scratch buffers, for beta=0
+        forward and beta=1 adjoints. Three rotated timing batches require a 3%
+        median gain plus two paired wins before replacing the default heuristic.
+        Existing plans are cached and never retuned by subsequent calls.
+        """
         mode = self.compute_dtype if compute_dtype is None else compute_dtype
         if mode not in ("float32", "float16"):
             raise ValueError("compute_dtype must be 'float32' or 'float16'")
@@ -151,6 +174,7 @@ class CudaLinear(nn.Linear):
             library = library_for(self.device)
             incoming, outgoing = self.in_features, self.out_features
             plans = []
+            operations = {}
             try:
                 # Row-major Warp arrays are their transposed column-major views.
                 # Y^T = W X^T; dX^T = W^T dY^T; dW^T = X^T dY.
@@ -159,12 +183,38 @@ class CudaLinear(nn.Linear):
                     (incoming, batch_size, outgoing, 0, 0, incoming, outgoing, incoming, False),
                     (incoming, outgoing, batch_size, 0, 1, incoming, outgoing, incoming, False),
                 )
-                for specification in specifications:
+                for index, specification in enumerate(specifications):
                     if mode == "float32":
                         handle = library.rl_plan_create(*specification, int(self.allow_tf32), self.workspace_limit)
                     else:
                         handle = library.rl_plan_create_mixed(*specification, 0, 1, self.workspace_limit)
-                    plans.append(NativePlan(library, handle, self.device))
+                    plan = NativePlan(library, handle, self.device)
+                    plans.append(plan)
+                    beta = 0.0 if index == 0 else 1.0
+                    tuning_seconds = 0.0
+                    if self.autotune:
+                        started = time.perf_counter()
+                        check(
+                            library,
+                            library.rl_plan_autotune(plan.handle, beta, stream_pointer(self.device)),
+                            "Autotune cuBLASLt dense operation",
+                        )
+                        tuning_seconds = time.perf_counter() - started
+                    raw = library.rl_plan_tuning_metadata(plan.handle)
+                    if raw is None:
+                        check(library, -1, "Read cuBLASLt tuning metadata")
+                    metadata = json.loads(raw)
+                    metadata.update(
+                        beta=beta,
+                        tuning_seconds=tuning_seconds,
+                        m=specification[0],
+                        n=specification[1],
+                        k=specification[2],
+                        bias=specification[-1],
+                        allow_tf32=self.allow_tf32 if mode == "float32" else False,
+                        workspace_limit_bytes=self.workspace_limit,
+                    )
+                    operations[("forward", "input_gradient", "weight_gradient")[index]] = metadata
                 workspace_bytes = max(library.rl_plan_workspace(plan.handle) for plan in plans)
                 if workspace_bytes == ctypes.c_size_t(-1).value:
                     check(library, -1, "Read cuBLASLt workspace size")
@@ -184,6 +234,11 @@ class CudaLinear(nn.Linear):
                     else None
                 )
                 self._cuda_plans[cache_key] = (plans, workspace, workspace_bytes, converted)
+                self._tuning_metadata[f"{batch_size}:{mode}"] = {
+                    "batch_size": batch_size,
+                    "compute_dtype": mode,
+                    "operations": operations,
+                }
             except Exception:
                 for plan in plans:
                     plan.close()
@@ -290,6 +345,7 @@ class CudaLinear(nn.Linear):
             for plan in plans:
                 plan.close()
         self._cuda_plans.clear()
+        self._tuning_metadata.clear()
         self._weight_shadow = None
         self._shadow_library = None
 
