@@ -51,8 +51,9 @@ class CudaBatchNorm(nn.BatchNorm):
             raise ValueError("BatchNorm epsilon must be positive and momentum must lie in [0, 1]")
         self.fused_relu = bool(relu)
         self._native_library = None
+        self._overwrite_control = None
 
-    def __call__(self, input, *, output_fp16=None, input_gradient_fp16=None):
+    def __call__(self, input, *, output_fp16=None, input_gradient_fp16=None, overwrite_dx=False):
         """Retain FP32 values and optionally fill explicit consumer-owned FP16 buffers.
 
         The optional buffer receives exact FP16 rounding after affine/ReLU in
@@ -64,6 +65,10 @@ class CudaBatchNorm(nn.BatchNorm):
         backward. Buffers must not overlap active FP32 storage or each other.
         The caller retains them and both layers through all graph replays;
         the usual single-live-call per shape contract still applies.
+
+        ``overwrite_dx=True`` declares a fresh first input-adjoint writer.
+        Ordinary calls accumulate. The private learner may defer this choice
+        until its complete tape inventory has been checked before backward.
         """
         _input(self, input)
         if input.shape[1] != self.num_features:
@@ -97,8 +102,11 @@ class CudaBatchNorm(nn.BatchNorm):
         weight, bias = _data(self.weight), _data(self.bias)
         running_mean, running_var = _data(self.running_mean), _data(self.running_var)
         tape = wp._src.context.runtime.tape
-        if input_gradient_fp16 is not None and (tape is None or input.grad is None or output.grad is None):
-            raise ValueError("input_gradient_fp16 requires a taped operation with FP32 input/output adjoints")
+        if (input_gradient_fp16 is not None or overwrite_dx) and (
+            tape is None or input.grad is None or output.grad is None
+        ):
+            raise ValueError("FP16/overwrite dx requires a taped operation with FP32 input/output adjoints")
+        overwrite_control = self._overwrite_control
         for name, buffer in (("output_fp16", output_fp16), ("input_gradient_fp16", input_gradient_fp16)):
             if buffer is None:
                 continue
@@ -156,13 +164,18 @@ class CudaBatchNorm(nn.BatchNorm):
                     _gradient(bias),
                 )
                 function = library.rl_flash_bn_backward
-                if input_gradient_fp16 is not None:
+                overwrite = bool(overwrite_dx and (overwrite_control is None or overwrite_control.enabled))
+                if overwrite:
+                    arrays += (input_gradient_fp16,)
+                    function = library.rl_flash_bn_backward_controlled
+                elif input_gradient_fp16 is not None:
                     arrays += (input_gradient_fp16,)
                     function = library.rl_flash_bn_backward_with_fp16
                 check(
                     library,
                     function(
                         *(pointer(value) for value in arrays),
+                        *((1,) if overwrite else ()),
                         *shape,
                         self.eps,
                         int(training),
@@ -171,6 +184,8 @@ class CudaBatchNorm(nn.BatchNorm):
                     ),
                     "Native BatchNorm backward",
                 )
+                if overwrite:
+                    input.grad.mark_init()
 
         tape.record_func(backward, _arrays(input, weight, bias, output))
         return output

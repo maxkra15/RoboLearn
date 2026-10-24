@@ -317,6 +317,47 @@ def fresh_optimizer_state(agent):
     return record
 
 
+def fresh_gradient_snapshot(agent):
+    """Collect host-only, unfiltered activation evidence outside update timers."""
+    active = bool(getattr(agent, "fresh_training_gradients", False))
+    method = getattr(agent, "fresh_gradient_metadata", None) if active else None
+    return {
+        "mode": active,
+        "method_called": callable(method),
+        "metadata": method() if callable(method) else {},
+        "zero_plan_status": {phase: dict(status) for phase, status in getattr(agent, "_zero_plan_status", {}).items()}
+        if active
+        else {},
+    }
+
+
+def validate_fresh_gradient_snapshot(snapshot):
+    """Require actual actor/critic overwrite and reduced clears when opted in."""
+    if not snapshot["mode"]:
+        return
+    if not snapshot["method_called"]:
+        raise RuntimeError("Requested fresh mode lacks host activation metadata")
+    for phase in ("actor", "critic"):
+        state = snapshot["metadata"].get(phase, {})
+        if (
+            state.get("enabled") is not True
+            or state.get("fallback_reason", "missing") is not None
+            or not all(
+                isinstance(state.get(key), int) and not isinstance(state[key], bool) and state[key] > 0
+                for key in ("owned_raw_arrays", "owned_raw_bytes", "remaining_clear_bytes")
+            )
+        ):
+            raise RuntimeError(f"Fresh-gradient mode did not activate completely for {phase}")
+        status = snapshot["zero_plan_status"].get(phase, {})
+        for key, expected in (
+            ("fresh_raw_arrays", state["owned_raw_arrays"]),
+            ("fresh_raw_bytes", state["owned_raw_bytes"]),
+            ("bytes", state["remaining_clear_bytes"]),
+        ):
+            if key in status and status[key] != expected:
+                raise RuntimeError(f"Fresh-gradient activation/clear-plan accounting differs for {phase}/{key}")
+
+
 def completed_update_budget(agent, calls, actor_period):
     """Audit cumulative complete work outside the timed update interval."""
     actor_calls = (calls + actor_period - 1) // actor_period
@@ -440,6 +481,7 @@ def run_backend(agent, name, args, transitions, common_weights, reference_replay
         "precision": "fp16_dense_fp32_state" if native and cfg.use_amp else "fp16_amp" if cfg.use_amp else "fp32",
         "fused_updates": native and agent.fused_updates,
         "cuda_autotune": bool(native and getattr(agent, "cuda_autotune", False)),
+        "fresh_training_gradients": bool(native and getattr(agent, "fresh_training_gradients", False)),
         "resolved_config": asdict(cfg),
         "network_compile": not native and cfg.use_compile,
         "captured_update": native,
@@ -455,6 +497,8 @@ def run_backend(agent, name, args, transitions, common_weights, reference_replay
     }
     result["records"].append(row)
     write_json(args.output, result)
+    if native and row["fresh_training_gradients"] != args.fresh_training_gradients:
+        raise RuntimeError("Native learner fresh-gradient selection differs from the requested flag")
     start = time.perf_counter()
     row["common_initial_weights_audit"] = load_common_weights(agent, common_weights)
     torch.cuda.synchronize(device)
@@ -489,6 +533,9 @@ def run_backend(agent, name, args, transitions, common_weights, reference_replay
         agent.prepare(capture=True)
     torch.cuda.synchronize(device)
     row["preparation_seconds"] = time.perf_counter() - start
+    row["fresh_gradient_state_after_prepare"] = fresh_gradient_snapshot(agent)
+    write_json(args.output, result)
+    validate_fresh_gradient_snapshot(row["fresh_gradient_state_after_prepare"])
     row["initial_optimizer_state"] = fresh_optimizer_state(agent)
     observations = transitions[-1]["next_observation"]
     native_observations = wp.from_torch(observations, dtype=wp.float32) if native else None
@@ -585,6 +632,9 @@ def run_backend(agent, name, args, transitions, common_weights, reference_replay
         key: sum(block["actual_optimizer_updates"][key] for block in row["blocks"])
         for key in ("actor", "critic", "temperature")
     }
+    row["fresh_gradient_state_after_updates"] = fresh_gradient_snapshot(agent)
+    write_json(args.output, result)
+    validate_fresh_gradient_snapshot(row["fresh_gradient_state_after_updates"])
     final = parameter_state(agent)
     np.savez(artifact_root / f"{name}-final-parameters.npz", **final)
     if native and agent.fused_updates and hasattr(agent, "_zero_plan_status"):
@@ -658,6 +708,9 @@ def run_backend(agent, name, args, transitions, common_weights, reference_replay
     # replay fixture is stored separately rather than duplicating its capacity.
     agent.save(str(artifact_root / name))
     row["checkpoint_saved"] = True
+    row["fresh_gradient_state_after_checkpoint"] = fresh_gradient_snapshot(agent)
+    write_json(args.output, result)
+    validate_fresh_gradient_snapshot(row["fresh_gradient_state_after_checkpoint"])
     if native and args.profile_native:
         row["profile"] = profile_native(agent, artifact_root / (name + "-trace.json"), args.updates)
     write_json(args.output, result)
@@ -718,6 +771,11 @@ def main():
         help="Select one learner for a fresh-process worker; the default compares all learners.",
     )
     parser.add_argument("--cuda-autotune", action="store_true", help="Opt into native CUDA dense-plan autotuning.")
+    parser.add_argument(
+        "--fresh-training-gradients",
+        action="store_true",
+        help="Opt into native private training-adjoint overwrite/clear optimization (requires amp-fused).",
+    )
     parser.add_argument("--record-clocks", action="store_true", help="Sample GPU clocks outside each timed block.")
     parser.add_argument(
         "--require-complete-updates",
@@ -760,6 +818,10 @@ def main():
     selected = "native" if args.only_native else args.backend
     if args.cuda_autotune and selected in ("official", "torch-port"):
         parser.error("--cuda-autotune requires a native backend row.")
+    if args.fresh_training_gradients and (
+        selected in ("official", "torch-port") or any(variant != "amp-fused" for variant in args.native_variants)
+    ):
+        parser.error("--fresh-training-gradients requires a native amp-fused backend row.")
     if args.warmup is None:
         args.warmup = 20 if args.recipe == "amp" else 10
     if args.official_root is None:
@@ -985,6 +1047,7 @@ def main():
                         dense_backend="cuda",
                         fused_updates=variant.endswith("-fused"),
                         **({"cuda_autotune": True} if args.cuda_autotune else {}),
+                        **({"fresh_training_gradients": True} if args.fresh_training_gradients else {}),
                     )
                     torch.cuda.synchronize(device)
                     native_startup = {"construction_seconds": time.perf_counter() - start}

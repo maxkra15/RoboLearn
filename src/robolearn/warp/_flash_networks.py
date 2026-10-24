@@ -228,12 +228,26 @@ class _ResidualBlock(nn.Module):
         self.norm1 = _batch_norm(hidden_dim * 4, requires_grad, fused, relu=True)
         self.norm2 = _batch_norm(hidden_dim, requires_grad, fused, relu=True)
         self.fused = fused
+        self._fresh_control = None
+        self._fresh_managed = False
         self.relu1 = nn.ReLU(requires_grad=requires_grad)
         self.relu2 = nn.ReLU(requires_grad=requires_grad)
         self.add = nn.Add(requires_grad=requires_grad)
         super().__post_init__()
 
     def __call__(self, input: wp.array) -> wp.array:
+        if self._fresh_managed and self._fresh_control is None and wp._src.context.runtime.tape is not None:
+            # External graph replays bypass host dirty flags. Ordinary taped
+            # forwards therefore initialize these managed private caches in
+            # either precision. Repeated backward on one forward still adds.
+            for layer in (self.w1.w, self.w2.w):
+                cached = layer._cache.get(((input.shape[0], layer.out_features), wp.float32))
+                owner = getattr(layer, "_fresh_raw_owners", {}).get((input.shape[0], layer.out_features))
+                if owner is not None:
+                    raw, gradient, span = owner
+                    if cached is not raw or raw.grad is not gradient or (gradient.ptr, gradient.size * 4) != span:
+                        raise RuntimeError("Restore prepared raw-adjoint ownership before ordinary taped use")
+                    gradient.zero_()
         if self.fused:
             from robolearn.cuda import CudaBatchNorm, CudaLinear
 
@@ -247,6 +261,7 @@ class _ResidualBlock(nn.Module):
             ):
                 batch = input.shape[0]
                 taped = wp._src.context.runtime.tape is not None
+                control = self._fresh_control
                 # Each raw dense output has exactly one consumer: its BN.
                 # BN is therefore the final adjoint writer before that dense
                 # callback, including input-only frozen-critic backwards.
@@ -258,9 +273,18 @@ class _ResidualBlock(nn.Module):
                 )
                 second_input = second.input_fp16_buffer(batch)
                 output = first(input, output_gradient_fp16=first_gradient)
-                output = self.norm1(output, output_fp16=second_input, input_gradient_fp16=first_gradient)
+                if control is not None:
+                    control.record(first, output)
+                output = self.norm1(
+                    output,
+                    output_fp16=second_input,
+                    input_gradient_fp16=first_gradient,
+                    overwrite_dx=control is not None,
+                )
                 output = second(output, input_fp16=second_input, output_gradient_fp16=second_gradient)
-                output = self.norm2(output, input_gradient_fp16=second_gradient)
+                if control is not None:
+                    control.record(second, output)
+                output = self.norm2(output, input_gradient_fp16=second_gradient, overwrite_dx=control is not None)
                 return self.add(output, input)
         output = self.w1(input)
         if self.fused:
@@ -367,6 +391,27 @@ class _FlashNetwork(nn.Module):
         finally:
             for layer, dtype in zip(layers, previous, strict=True):
                 layer.compute_dtype = dtype
+
+    @contextmanager
+    def _fresh_gradient_scope(self, control):
+        """Bind a private phase decision to callbacks recorded by this forward."""
+        from robolearn.cuda.normalization import CudaBatchNorm
+
+        modules = list(self._all_modules())
+        try:
+            for module in modules:
+                if isinstance(module, _ResidualBlock):
+                    module._fresh_managed = True
+                    module._fresh_control = control
+                elif isinstance(module, CudaBatchNorm):
+                    module._overwrite_control = control
+            yield
+        finally:
+            for module in modules:
+                if isinstance(module, _ResidualBlock):
+                    module._fresh_control = None
+                elif isinstance(module, CudaBatchNorm):
+                    module._overwrite_control = None
 
     @contextmanager
     def freeze_parameters(self):

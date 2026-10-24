@@ -882,6 +882,291 @@ def normalization_fp16_gradient(report, rng):
         report.arrays(f"alias/{name}/unchanged", value, before[name], exact=True)
 
 
+def fresh_gradient_primitives(report, rng):
+    """Check first-writer assignment and transitions back to ordinary gradients."""
+    from robolearn.cuda import CudaBatchNorm
+    from robolearn.flashsac import FlashSACConfig
+    from robolearn.warp import WarpFlashSAC
+
+    x = rng.normal(0, 0.3, (17, 19)).astype(np.float32)
+    dy = wp.array(rng.normal(0, 0.03, x.shape).astype(np.float32))
+    unrelated = wp.array(np.full(7, 0.25, np.float32), requires_grad=True)
+    unrelated.grad.fill_(0.75)
+    for relu in (False, True):
+        for training in (False, True):
+            label = f"relu{int(relu)}-training{int(training)}"
+            sources = [wp.array(x, requires_grad=True) for _ in range(2)]
+            norms = [CudaBatchNorm(19, relu=relu) for _ in range(2)]
+            for norm in norms:
+                norm.train(training)
+            initial = [snapshot(norm.state_dict()) for norm in norms]
+            half = wp.empty(x.shape, dtype=wp.float16)
+
+            def run(index):
+                source, norm = sources[index], norms[index]
+                source.grad.fill_(float("nan") if index else 0.0)
+                for parameter in norm.parameters():
+                    parameter.grad.fill_(0.007)
+                with wp.Tape() as tape:
+                    output = norm(source, overwrite_dx=bool(index), input_gradient_fp16=half if index else None)
+                output.grad.zero_()
+                tape.backward(grads={output: dy})
+                return output
+
+            def values(index, output):
+                return {
+                    "output": output.numpy().copy(),
+                    "dx": sources[index].grad.numpy().copy(),
+                    "dw": norms[index].weight.grad.numpy().copy(),
+                    "db": norms[index].bias.grad.numpy().copy(),
+                }
+
+            reference = values(0, run(0))
+            eager = values(1, run(1))
+            for name in reference:
+                report.arrays(f"{label}/overwrite/{name}", eager[name], reference[name])
+            report.arrays(f"{label}/exact_half", half.numpy(), eager["dx"].astype(np.float16), exact=True)
+            restore(norms[1].state_dict(), initial[1])
+            with wp.ScopedCapture() as capture:
+                output = run(1)
+            for index in range(2):
+                restore(norms[1].state_dict(), initial[1])
+                half.fill_(-123.0)
+                wp.capture_launch(capture.graph)
+                actual = values(1, output)
+                for name in reference:
+                    report.arrays(f"{label}/capture{index}/{name}", actual[name], reference[name])
+                report.arrays(f"{label}/capture{index}/half", half.numpy(), actual["dx"].astype(np.float16), exact=True)
+            with wp.Tape() as tape:
+                output = norms[0](sources[0])
+            sources[0].grad.fill_(0.25)
+            output.grad.zero_()
+            for _ in range(2):
+                tape.backward(grads={output: dy})
+            report.arrays(f"{label}/ordinary_repeated_accumulates", sources[0].grad.numpy(), 0.25 + 2 * reference["dx"])
+    report.arrays("unrelated/value_untouched", unrelated.numpy(), np.full(7, 0.25, np.float32), exact=True)
+    report.arrays("unrelated/adjoint_untouched", unrelated.grad.numpy(), np.full(7, 0.75, np.float32), exact=True)
+
+    cfg = FlashSACConfig(
+        device=str(wp.get_device()),
+        seed=report.data["seed"],
+        use_amp=True,
+        use_compile=False,
+        normalize_reward=False,
+        actor_hidden_dim=16,
+        critic_hidden_dim=32,
+        actor_num_blocks=1,
+        critic_num_blocks=1,
+        critic_num_bins=11,
+        sample_batch_size=8,
+        buffer_max_length=64,
+        buffer_min_length=4,
+    )
+    agents = [
+        WarpFlashSAC(9, 3, 4, cfg, dense_backend="cuda", fused_updates=True, fresh_training_gradients=fresh)
+        for fresh in (False, True)
+    ]
+    for agent in agents:
+        agent.prepare(capture=True)
+    initial = agents[0].state_dict(include_replay=False)
+    for agent in agents:
+        agent.load_state_dict(initial)
+    fixed = {
+        "observation": rng.normal(0, 0.3, (8, 9)).astype(np.float32),
+        "next_observation": rng.normal(0, 0.3, (8, 9)).astype(np.float32),
+        "action": rng.uniform(-0.3, 0.3, (8, 3)).astype(np.float32),
+        "reward": rng.uniform(-0.1, 0.1, 8).astype(np.float32),
+        "terminated": np.zeros(8, np.int32),
+        "truncated": np.zeros(8, np.int32),
+        "discount": np.full(8, cfg.gamma**cfg.n_step, np.float32),
+    }
+    noises = rng.normal(0, 0.2, (16, 3)).astype(np.float32), rng.normal(0, 0.2, (8, 3)).astype(np.float32)
+
+    def install(agent):
+        for key, value in fixed.items():
+            agent._assign(agent.batch[key], value, key)
+        agent.actor_noise.assign(noises[0])
+        agent.next_noise.assign(noises[1])
+
+    for agent in agents:
+        install(agent)
+        for phase in agent._fresh_phases.values():
+            for _, _, gradient, _ in phase.owners:
+                gradient.fill_(float("nan"))
+        agent.launch_update(True, sample=False, randomize_noise=False)
+        agent._update_step += 1
+    states = [agent.state_dict(include_replay=False) for agent in agents]
+    for key, value in states[0].items():
+        report.arrays(f"full_clear_reference/{key}", states[1][key], value, atol=5e-5, rtol=5e-5)
+    report.check("fresh_active", all(value["enabled"] for value in agents[1].fresh_gradient_metadata().values()))
+    for agent in agents:
+        agent.update_from_batch(
+            fixed, actor_noise=noises[0], next_noise=noises[1], do_actor_update=True, apply_optimizer=False
+        )
+    for index, (left, right) in enumerate(zip(agents[0].parameters(), agents[1].parameters(), strict=True)):
+        report.arrays(
+            f"ordinary_diagnostic_gradient/{index}", right.grad.numpy(), left.grad.numpy(), atol=5e-5, rtol=5e-5
+        )
+    for agent in agents:
+        report.check("retained_tapes/" + str(agent.fresh_training_gradients), len(agent._retained_tapes) == 3)
+        agent._retained_tapes[-1].backward(agent.critic_loss)
+    for index, (left, right) in enumerate(zip(agents[0].parameters(), agents[1].parameters(), strict=True)):
+        report.arrays(
+            f"retained_repeated_gradient/{index}", right.grad.numpy(), left.grad.numpy(), atol=1e-4, rtol=1e-4
+        )
+
+    observations = wp.array(np.concatenate((fixed["observation"], fixed["next_observation"])))
+    actor_seed = wp.array(np.full((16, 3), 0.01, np.float32))
+    for precision in ("float16", "float32"):
+        tapes, gradients = [], []
+        for agent, state in zip(agents, states, strict=True):
+            agent.load_state_dict(state)
+            for phase in agent._fresh_phases.values():
+                for _, _, gradient, _ in phase.owners:
+                    gradient.fill_(float("nan"))
+            with wp.Tape() as tape, agent.actor.precision(precision):
+                mean, log_std = agent.actor(observations, training=True)
+            log_std.grad.zero_()
+            tape.backward(grads={mean: actor_seed})
+            gradients.append([value.grad.numpy().copy() for value in agent.actor.parameters()])
+            tapes.append(tape)
+        for index, (reference, actual) in enumerate(zip(*gradients, strict=True)):
+            report.arrays(f"ordinary_actor_tape/{precision}/{index}", actual, reference, atol=1e-4, rtol=1e-4)
+        for tape in tapes:
+            tape.zero()
+
+    # Overflow leaves private raw adjoints nonfinite; a following fresh phase
+    # must overwrite them without relying on a hidden full activation clear.
+    fresh = agents[1]
+    fresh.load_state_dict(initial)
+    install(fresh)
+    for optimizer in (fresh.actor_optimizer, fresh.critic_optimizer):
+        optimizer.loss_scale.fill_(1e30)
+    fresh.launch_update(True, sample=False, randomize_noise=False)
+    fresh._update_step += 1
+    for name in ("actor", "critic"):
+        optimizer = getattr(fresh, name + "_optimizer")
+        report.check(
+            f"overflow/{name}/skipped",
+            int(optimizer.skipped_steps.numpy()[0]) == 1 and int(optimizer._timestep.numpy()[0]) == 0,
+        )
+        optimizer.loss_scale.fill_(1.0)
+    fresh.launch_update(True, sample=False, randomize_noise=False)
+    fresh._update_step += 1
+    for name in ("actor", "critic"):
+        optimizer = getattr(fresh, name + "_optimizer")
+        report.check(
+            f"recovery/{name}/accounting",
+            int(optimizer.attempted_steps.numpy()[0]) == 2
+            and int(optimizer.skipped_steps.numpy()[0]) == 1
+            and int(optimizer._timestep.numpy()[0]) == 1,
+        )
+    report.check("recovery/finite_state", all(np.isfinite(v).all() for v in fresh.state_dict().values()))
+    report.check(
+        "recovery/finite_owned_raw",
+        all(np.isfinite(g.numpy()).all() for phase in fresh._fresh_phases.values() for _, _, g, _ in phase.owners),
+    )
+    # A valid owner replacement selects full pre-clear + accumulation; invalid
+    # overlap/storage must abort before any optimizer can mutate parameters.
+    for agent in agents:
+        agent.load_state_dict(initial)
+    phase = fresh._fresh_phases["actor"]
+    _, raw, original_gradient, _ = phase.owners[0]
+    try:
+        raw.grad = wp.empty_like(original_gradient)
+        agents[0].update_from_batch(fixed, actor_noise=noises[0], next_noise=noises[1], do_actor_update=True)
+        fresh.update_from_batch(fixed, actor_noise=noises[0], next_noise=noises[1], do_actor_update=True)
+        metadata = fresh.fresh_gradient_metadata()["actor"]
+        report.check(
+            "changed_owner/fallback",
+            not metadata["enabled"] and metadata["fallback_reason"] == "gradient_pointer_signature_changed",
+        )
+        report.check("changed_owner/finite_state", all(np.isfinite(v).all() for v in fresh.state_dict().values()))
+        for key, value in agents[0].state_dict(include_replay=False).items():
+            report.arrays(
+                f"changed_owner/full_clear_reference/{key}",
+                fresh.state_dict(include_replay=False)[key],
+                value,
+                atol=5e-5,
+                rtol=5e-5,
+            )
+    finally:
+        raw.grad = original_gradient
+    from robolearn.warp._fresh_gradients import FreshPhase
+
+    layer = phase.owners[0][0]
+    probe = wp.array(rng.normal(0, 0.3, (raw.shape[0], layer.in_features)).astype(np.float32), requires_grad=True)
+    norm = CudaBatchNorm(layer.out_features)
+    with wp.Tape() as tape:
+        raw = layer(probe)
+        output = norm(raw)
+    original_gradient = raw.grad
+    parameter_arrays = {
+        str(i): value for i, value in enumerate(fresh.parameters() + [p.data for p in norm.parameters()])
+    }
+    before_parameters = snapshot(parameter_arrays)
+    before_counters = snapshot(
+        {
+            "updates": fresh.update_counters,
+            **{name: getattr(fresh, name + "_optimizer")._timestep for name in ("actor", "critic", "temperature")},
+        }
+    )
+    backing = wp.empty(2 * raw.size, dtype=wp.float32)
+    invalid = {
+        "strided": wp.array(
+            ptr=backing.ptr, dtype=wp.float32, shape=raw.shape, strides=(raw.shape[1] * 8, 8), device=raw.device
+        ),
+        "extent": wp.array(
+            ptr=backing.ptr, dtype=wp.float32, shape=(raw.shape[0], raw.shape[1] - 1), device=raw.device
+        ),
+    }
+    for name, value in invalid.items():
+        try:
+            raw.grad = value
+        except ValueError:
+            report.check(f"invalid_raw/{name}/setter_rejected_before_backward", raw.grad is original_gradient)
+        else:
+            report.check(f"invalid_raw/{name}/setter_rejected_before_backward", False)
+    original_gradient.fill_(0.125)
+    output.grad.fill_(0.375)
+    try:
+        raw.grad = output.grad
+        control = FreshPhase(raw.device).begin()
+        control.record(layer, raw)
+        try:
+            control.select(tape)
+        except RuntimeError as error:
+            report.check("invalid_raw/alias/rejected_before_backward", "raw_adjoint_alias" in str(error))
+        else:
+            report.check("invalid_raw/alias/rejected_before_backward", False)
+        report.arrays(
+            "invalid_raw/alias/foreign_storage_untouched",
+            output.grad.numpy(),
+            np.full(output.shape, 0.375, np.float32),
+            exact=True,
+        )
+        report.arrays(
+            "invalid_raw/alias/original_storage_untouched",
+            original_gradient.numpy(),
+            np.full(raw.shape, 0.125, np.float32),
+            exact=True,
+        )
+    finally:
+        raw.grad = original_gradient
+    for name, value in snapshot(parameter_arrays).items():
+        report.arrays(f"invalid_raw/parameters_unchanged/{name}", value, before_parameters[name], exact=True)
+    for name, value in before_counters.items():
+        actual = fresh.update_counters if name == "updates" else getattr(fresh, name + "_optimizer")._timestep
+        report.arrays(f"invalid_raw/counters_unchanged/{name}", actual.numpy(), value, exact=True)
+    fresh.load_state_dict(initial)
+    report.check(
+        "load/all_omitted_raw_zero",
+        all(not np.count_nonzero(g.numpy()) for phase in fresh._fresh_phases.values() for _, _, g, _ in phase.owners),
+    )
+    report.current["fresh_gradient_metadata"] = fresh.fresh_gradient_metadata()
+    np.savez(report.artifacts / "fresh-gradient-primitives.npz", **states[1])
+
+
 def categorical(report, rng, bins=101):
     from robolearn.cuda.categorical import CudaCategorical, categorical_target
     from robolearn.warp.flashsac import _categorical_target
@@ -1016,7 +1301,18 @@ def learner_controls(report, label, agent, scheduled):
         report.check(f"{label}/{name}/actual_progress", actual > 0, completed_updates=actual)
 
 
-def flash_recipe(report, rng, *, amp, fused, g1=False, updates=8, batch_size=32, cuda_autotune=False):
+def flash_recipe(
+    report,
+    rng,
+    *,
+    amp,
+    fused,
+    g1=False,
+    updates=8,
+    batch_size=32,
+    cuda_autotune=False,
+    fresh_training_gradients=False,
+):
     from robolearn.flashsac import FlashSACConfig
     from robolearn.warp import WarpFlashSAC
 
@@ -1045,6 +1341,7 @@ def flash_recipe(report, rng, *, amp, fused, g1=False, updates=8, batch_size=32,
             dense_backend="cuda",
             fused_updates=fused,
             cuda_autotune=cuda_autotune,
+            fresh_training_gradients=fresh_training_gradients,
         )
         for _ in range(2)
     ]
@@ -1052,6 +1349,8 @@ def flash_recipe(report, rng, *, amp, fused, g1=False, updates=8, batch_size=32,
     label = f"{'g1' if g1 else 'small'}-amp{int(amp)}-fused{int(fused)}"
     if cuda_autotune:
         label += "-autotuned"
+    if fresh_training_gradients:
+        label += "-fresh"
     for _ in range(cfg.n_step + 2):
         observation = wp.array(rng.normal(0, 0.3, (num_envs, observation_dim)).astype(np.float32))
         actions = wp.array(rng.uniform(-0.3, 0.3, (num_envs, action_dim)).astype(np.float32))
@@ -1178,6 +1477,7 @@ def flash_recipe(report, rng, *, amp, fused, g1=False, updates=8, batch_size=32,
     )
     if fused:
         plans = {}
+        fresh_metadata = {}
         for name, agent in zip(("eager", "captured"), agents, strict=True):
             plans[name] = {key: dict(value) for key, value in agent._zero_plan_status.items()}
             report.check(
@@ -1193,7 +1493,32 @@ def flash_recipe(report, rng, *, amp, fused, g1=False, updates=8, batch_size=32,
                     not np.count_nonzero(array.numpy()) for plan in agent._zero_plans.values() for array in plan._arrays
                 ),
             )
+            if fresh_training_gradients:
+                metadata = agent.fresh_gradient_metadata()
+                report.check(
+                    f"{label}/{name}/fresh_activated",
+                    set(metadata) == {"actor", "critic"}
+                    and all(
+                        value["enabled"] and value["fallback_reason"] is None and value["owned_raw_bytes"] > 0
+                        for value in metadata.values()
+                    ),
+                    metadata=metadata,
+                )
+                for phase, state in agent._fresh_phases.items():
+                    report.check(
+                        f"{label}/{name}/{phase}/fresh_raw_finite",
+                        all(np.isfinite(gradient.numpy()).all() for _, _, gradient, _ in state.owners),
+                    )
+                    report.check(
+                        f"{label}/{name}/{phase}/fresh_inventory",
+                        plans[name][phase]["fresh_raw_bytes"] == metadata[phase]["owned_raw_bytes"]
+                        and plans[name][phase]["fresh_raw_arrays"] == metadata[phase]["owned_raw_arrays"]
+                        and plans[name][phase]["bytes"] == metadata[phase]["remaining_clear_bytes"],
+                    )
+                fresh_metadata[name] = metadata
         report.current["gradient_zero_plans"] = plans
+        if fresh_training_gradients:
+            report.current["fresh_gradient_metadata"] = fresh_metadata
     else:
         report.check(f"{label}/ordinary_clear", all(not agent._zero_plans for agent in agents))
     tuning = {}
@@ -1206,6 +1531,7 @@ def flash_recipe(report, rng, *, amp, fused, g1=False, updates=8, batch_size=32,
         amp=amp,
         fused=fused,
         cuda_autotune=cuda_autotune,
+        fresh_training_gradients=fresh_training_gradients,
         cuda_tuning_metadata=tuning,
         batch_size=batch_size,
         observation_dim=observation_dim,
@@ -1266,6 +1592,22 @@ def main():
                             batch_size=args.g1_batch_size,
                             cuda_autotune=autotune,
                         )
+            with report.stage("fresh-gradient-primitives"):
+                fresh_gradient_primitives(report, rng)
+            with report.stage("small-amp1-fused1-fresh"):
+                flash_recipe(report, rng, amp=True, fused=True, fresh_training_gradients=True)
+            if not args.skip_g1:
+                with report.stage("g1-shaped-amp-fused-fresh"):
+                    flash_recipe(
+                        report,
+                        rng,
+                        amp=True,
+                        fused=True,
+                        g1=True,
+                        updates=args.g1_updates,
+                        batch_size=args.g1_batch_size,
+                        fresh_training_gradients=True,
+                    )
         report.data["status"] = "passed"
     except BaseException:
         report.data.update(status="failed", traceback=traceback.format_exc())

@@ -30,6 +30,8 @@
 //     int B,int C,float eps,int training,int relu,void* stream);
 // int rl_flash_bn_backward_with_fp16(...same eleven FP32 arrays...,half_dx,
 //     batch,channels,eps,training,relu,stream): round final accumulated dx.
+// int rl_flash_bn_backward_controlled(...same eleven FP32 arrays...,half_dx,
+//     int overwrite_dx,int B,int C,float eps,int training,int relu,void* stream);
 // int rl_flash_rms_forward(x,w,var,y,int B,int C,float eps,void* stream);
 // int rl_flash_rms_backward(x,dy,w,var,partial,dx,dw,int B,int C,float eps,void* stream);
 // Forward partial/scratch: BN 2*ceil(B/256)*C; RMS var B.
@@ -284,7 +286,7 @@ __global__ void bn_gradient_reduce(const float* partial, float* sums, float* dw,
     if (db) db[channel] += sum;
 }
 
-template <bool WriteHalf>
+template <bool WriteHalf, bool Overwrite = false>
 __global__ void bn_backward_apply(const float* x, const float* dy, const float* output, const float* weight,
                                   const float* mean, const float* variance, const float* sums, float* dx,
                                   __half* half_dx,
@@ -310,7 +312,8 @@ __global__ void bn_backward_apply(const float* x, const float* dy, const float* 
         float gradient = relu && output[index] <= 0.0f ? 0.0f : dy[index];
         if (training) gradient = gradient - gradient_means[lane]
             - (x[index] - averages[lane]) * inverses[lane] * normalized_means[lane];
-        const float updated = dx[index] + weights[lane] * inverses[lane] * gradient;
+        const float contribution = weights[lane] * inverses[lane] * gradient;
+        const float updated = Overwrite ? contribution : dx[index] + contribution;
         dx[index] = updated;
         if constexpr (WriteHalf) half_dx[index] = __float2half_rn(updated);
     }
@@ -542,7 +545,7 @@ extern "C" int rl_flash_bn_forward_with_fp16(const float* x, const float* w, con
 static int flash_bn_backward(const float* x, const float* dy, const float* y, const float* w,
                                      const float* mean, const float* var, float* partial, float* sums,
                                      float* dx, float* dw, float* db, __half* half_dx, int batch, int channels, float eps,
-                                     int training, int relu, void* stream) noexcept {
+                                     int training, int relu, void* stream, bool overwrite_dx = false) noexcept {
     last_error[0] = '\0';
     if (!flash_native::dimensions(batch, channels, eps)) return -1;
     if (!x || !dy || !y || !mean || !var || !partial || !sums) { set_error("Invalid BN backward arrays."); return -1; }
@@ -558,7 +561,13 @@ static int flash_bn_backward(const float* x, const float* dy, const float* y, co
     }
     if (dx) {
         const dim3 grid((channels + 31) / 32, (batch + flash_native::ApplyRows - 1) / flash_native::ApplyRows);
-        if (half_dx) {
+        if (overwrite_dx && half_dx) {
+            flash_native::bn_backward_apply<true, true><<<grid, 256, 0, st>>>(x, dy, y, w, mean, var, sums, dx,
+                half_dx, batch, channels, eps, training != 0, relu != 0);
+        } else if (overwrite_dx) {
+            flash_native::bn_backward_apply<false, true><<<grid, 256, 0, st>>>(x, dy, y, w, mean, var, sums, dx,
+                nullptr, batch, channels, eps, training != 0, relu != 0);
+        } else if (half_dx) {
             flash_native::bn_backward_apply<true><<<grid, 256, 0, st>>>(x, dy, y, w, mean, var, sums, dx,
                 half_dx, batch, channels, eps, training != 0, relu != 0);
         } else {
@@ -585,6 +594,18 @@ extern "C" int rl_flash_bn_backward_with_fp16(const float* x, const float* dy, c
     if (!half_dx) { set_error("FP16 BN input adjoint must be nonnull."); return -1; }
     return flash_bn_backward(x, dy, y, w, mean, var, partial, sums, dx, dw, db, half_dx,
                              batch, channels, eps, training, relu, stream);
+}
+
+extern "C" int rl_flash_bn_backward_controlled(const float* x, const float* dy, const float* y, const float* w,
+                                               const float* mean, const float* var, float* partial, float* sums,
+                                               float* dx, float* dw, float* db, __half* half_dx, int overwrite_dx,
+                                               int batch, int channels, float eps,
+                                               int training, int relu, void* stream) noexcept {
+    if (!dx || (overwrite_dx != 0 && overwrite_dx != 1)) {
+        set_error("Controlled BN backward requires dx and a Boolean overwrite flag."); return -1;
+    }
+    return flash_bn_backward(x, dy, y, w, mean, var, partial, sums, dx, dw, db, half_dx,
+                             batch, channels, eps, training, relu, stream, overwrite_dx != 0);
 }
 
 extern "C" int rl_flash_rms_forward(const float* x, const float* w, float* var, float* y,

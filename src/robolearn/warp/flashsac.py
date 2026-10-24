@@ -19,6 +19,7 @@ import json
 import math
 import warnings
 from collections.abc import Mapping
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -328,6 +329,12 @@ class WarpFlashSAC:
     CUDA capture covers replay sampling and learning, not the caller's simulator
     or Torch MDP. ``launch_update`` can be included in an external graph once
     prepared; the caller then owns host readiness and phase bookkeeping.
+
+    ``fresh_training_gradients`` opts into assigning private residual raw
+    adjoints before consuming them, on native AMP fused optimizer phases only.
+    Other adjoints retain full clearing. Ordinary taped forwards initialize
+    managed raw caches; repeated backward on one forward still accumulates.
+    Prepared graph buffers must retain their original storage.
     """
 
     def __init__(
@@ -342,12 +349,15 @@ class WarpFlashSAC:
         dense_backend: str = "warp",
         fused_updates: bool = False,
         cuda_autotune: bool = False,
+        fresh_training_gradients: bool = False,
     ):
         if dense_backend not in ("warp", "cuda"):
             raise ValueError("dense_backend must be 'warp' or 'cuda'.")
         cfg = cfg or FlashSACConfig()
         if (cfg.use_amp or fused_updates or cuda_autotune) and dense_backend != "cuda":
             raise ValueError("Mixed precision, fused updates and CUDA plan tuning require dense_backend='cuda'.")
+        if fresh_training_gradients and (dense_backend != "cuda" or not cfg.use_amp or not fused_updates):
+            raise ValueError("Fresh training gradients require native CUDA, AMP and fused_updates=True.")
         if min(observation_dim, action_dim, num_envs) < 1:
             raise ValueError("Observation, action and environment dimensions must be positive.")
         total_dim = critic_observation_dim or observation_dim
@@ -378,14 +388,21 @@ class WarpFlashSAC:
         self.dense_backend = dense_backend
         self.fused_updates = fused_updates
         self.cuda_autotune = bool(cuda_autotune)
+        self.fresh_training_gradients = bool(fresh_training_gradients)
         self.compute_dtype = "float16" if cfg.use_amp else "float32"
         self._update_step = 0
         self._prepared = False
         self._update_graphs = {}
+        self._captured_fresh_policy = ()
         self._retained_tapes = []
         self._zero_plans = {}
         self._zero_plan_disabled = set()
         self._zero_plan_status = {}
+        self._fresh_phases = {}
+        if self.fresh_training_gradients:
+            from ._fresh_gradients import FreshPhase
+
+            self._fresh_phases = {phase: FreshPhase(self.device) for phase in ("actor", "critic")}
         with wp.ScopedDevice(self.device):
             self.actor = FlashActor(
                 observation_dim,
@@ -641,7 +658,31 @@ class WarpFlashSAC:
         else:
             tape.backward(loss)
 
-    def _zero_tape(self, tape, phase: str) -> None:
+    @contextmanager
+    def _fresh_scope(self, phase, apply_optimizer, *networks):
+        if not self.fresh_training_gradients or not apply_optimizer:
+            yield None
+            return
+        control = self._fresh_phases[phase].begin()
+        with ExitStack() as stack:
+            for network in networks:
+                stack.enter_context(network._fresh_gradient_scope(control))
+            yield control
+
+    def fresh_gradient_metadata(self) -> dict:
+        """Return host-only activation/fallback and clear-byte records."""
+        return {
+            phase: {
+                "enabled": state.plan is not None and state.disabled_reason is None,
+                "fallback_reason": state.disabled_reason,
+                "owned_raw_arrays": len(state.owners),
+                "owned_raw_bytes": sum(span[1] for *_, span in state.owners),
+                "remaining_clear_bytes": state.plan.total_bytes if state.plan is not None else None,
+            }
+            for phase, state in self._fresh_phases.items()
+        }
+
+    def _zero_tape(self, tape, phase: str, control=None) -> None:
         """Clear a complete phase's adjoints with bounded, verified metadata.
 
         Network buffers are shape caches and checkpoint loads copy in place.
@@ -649,6 +690,10 @@ class WarpFlashSAC:
         changed/unsupported inventory permanently uses Warp's original clear
         for that phase; old metadata stays alive for any existing CUDA graph.
         """
+        if control is not None and control.enabled:
+            self._zero_plans[phase] = control.phase.plan
+            self._zero_plan_status[phase] = control.clear(tape)
+            return
         if not self.fused_updates:
             tape.zero()
             return
@@ -691,7 +736,10 @@ class WarpFlashSAC:
         self.mean_action.zero_()
         self._q_abs.zero_()
         wp.launch(_temperature_value, dim=1, inputs=[self.log_temperature, self.alpha], device=self.device)
-        with self.critic.freeze_parameters():
+        with (
+            self.critic.freeze_parameters(),
+            self._fresh_scope("actor", apply_optimizer, self.actor, self.critic) as control,
+        ):
             with wp.Tape() as tape:
                 mean, log_std = self.actor(self._actor_observations, training=True)
                 wp.launch(
@@ -731,11 +779,15 @@ class WarpFlashSAC:
                     outputs=[self.actor_loss],
                     device=self.device,
                 )
+            if control is not None:
+                control.select(tape)
             self._backward(tape, self.actor_loss, self.actor_optimizer, scaled=apply_optimizer)
             if apply_optimizer:
+                if control is not None:
+                    control.finish(tape)
                 self._step(self.actor_optimizer)
                 self.actor.normalize_parameters()
-                self._zero_tape(tape, "actor")
+                self._zero_tape(tape, "actor", control)
             else:
                 self._retained_tapes.append(tape)
 
@@ -803,22 +855,27 @@ class WarpFlashSAC:
         else:
             wp.launch(_categorical_target, dim=self.batch_size, inputs=target_inputs, device=self.device)
         self.critic_loss.zero_()
-        with wp.Tape() as tape:
-            _, log_probs = self.critic(self._critic_observations, self._critic_actions, training=True)
-            wp.launch(
-                _critic_objective,
-                dim=(2, self.batch_size),
-                inputs=[log_probs, self.target_probabilities],
-                outputs=[self.critic_loss],
-                device=self.device,
-            )
-        self._backward(tape, self.critic_loss, self.critic_optimizer, scaled=apply_optimizer)
-        if apply_optimizer:
-            self._step(self.critic_optimizer)
-            self.critic.normalize_parameters()
-            self._zero_tape(tape, "critic")
-        else:
-            self._retained_tapes.append(tape)
+        with self._fresh_scope("critic", apply_optimizer, self.critic) as control:
+            with wp.Tape() as tape:
+                _, log_probs = self.critic(self._critic_observations, self._critic_actions, training=True)
+                wp.launch(
+                    _critic_objective,
+                    dim=(2, self.batch_size),
+                    inputs=[log_probs, self.target_probabilities],
+                    outputs=[self.critic_loss],
+                    device=self.device,
+                )
+            if control is not None:
+                control.select(tape)
+            self._backward(tape, self.critic_loss, self.critic_optimizer, scaled=apply_optimizer)
+            if apply_optimizer:
+                if control is not None:
+                    control.finish(tape)
+                self._step(self.critic_optimizer)
+                self.critic.normalize_parameters()
+                self._zero_tape(tape, "critic", control)
+            else:
+                self._retained_tapes.append(tape)
 
     def launch_update(
         self,
@@ -835,6 +892,9 @@ class WarpFlashSAC:
         graph choice; device counters and RNG advance each replay. ``sample=False``
         uses ``batch``, ``actor_noise`` and ``next_noise`` for numerical diagnostics.
         """
+        if self.fresh_training_gradients and not apply_optimizer:
+            for phase in self._fresh_phases.values():
+                phase.clear()
         if sample:
             self.replay.sample(check_ready=False)
         reward = self.batch["reward"]
@@ -954,11 +1014,21 @@ class WarpFlashSAC:
         self.prepare(capture=False)
         if not self.device.is_cuda:
             return
+        # As with the other native plans, already captured graphs require
+        # fixed owned storage. Full owner checks happen before eager backward
+        # and during capture recording, never on each timed graph replay.
+        policy = tuple((name, phase.disabled_reason) for name, phase in self._fresh_phases.items())
+        if policy != self._captured_fresh_policy:
+            self._update_graphs.clear()
+            self._captured_fresh_policy = policy
         for phase in (True, False):
             if phase not in self._update_graphs:
                 with wp.ScopedCapture(device=self.device) as captured:
                     self.launch_update(phase)
                 self._update_graphs[phase] = captured.graph
+        if policy != tuple((name, phase.disabled_reason) for name, phase in self._fresh_phases.items()):
+            self._update_graphs.clear()
+            raise RuntimeError("Fresh-gradient policy changed during capture; prepare stable buffers before replay")
 
     def update(self, *, tensor_metrics: bool = False, capture: bool = True) -> dict:
         """Perform one replay update, choosing the actor phase from the host mirror."""
@@ -993,6 +1063,8 @@ class WarpFlashSAC:
         return result
 
     def _clear_gradients(self) -> None:
+        for phase in self._fresh_phases.values():
+            phase.clear()
         for tape in self._retained_tapes:
             tape.zero()
         self._retained_tapes.clear()
@@ -1110,6 +1182,7 @@ class WarpFlashSAC:
             "dense_backend": self.dense_backend,
             "fused_updates": self.fused_updates,
             "cuda_autotune": self.cuda_autotune,
+            "fresh_training_gradients": self.fresh_training_gradients,
             "replay_included": include_replay,
         }
         state = self.state_dict(include_replay=include_replay)
