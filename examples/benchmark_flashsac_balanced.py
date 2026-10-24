@@ -100,6 +100,8 @@ def validate_worker(source, label, args, common):
         "Worker controls failed",
     )
     require(row["cuda_autotune"] == tuned, "Actual autotuning selection differs")
+    fresh = args.fresh_training_gradients and backend == "native"
+    require(row["fresh_training_gradients"] is fresh, "Actual fresh-gradient selection differs")
     require(row["initial_optimizer_state"]["accepted"], "Worker optimizer/scaler/counters were not fresh")
     require(
         row["common_initial_weights_audit"]["exactly_equal"] and row["replay_audit"]["accepted"],
@@ -125,6 +127,7 @@ def validate_worker(source, label, args, common):
         for key in ("python", "torch", "warp", "warp_nn", "gpu"):
             require(source["runtime"][key] == common["runtime"][key], f"Worker runtime {key} differs")
     protocol = source["arguments"]
+    require(protocol["fresh_training_gradients"] is fresh, "Worker fresh-gradient argument differs")
     for key in ("warmup", "updates", "actor_calls", "seed", "observations", "actions", "num_envs", "batch_size"):
         require(protocol[key] == getattr(args, key), f"Worker {key} budget differs")
     require(
@@ -201,6 +204,8 @@ def run_worker(label, phase, directory, args, result, common, canonical, round_i
         command += ["--initial-weights", str(canonical)]
     if tuned:
         command.append("--cuda-autotune")
+    if args.fresh_training_gradients and backend == "native":
+        command.append("--fresh-training-gradients")
     command += ["--output", str(output)]
     receipt = {
         "label": label,
@@ -252,6 +257,7 @@ def run_worker(label, phase, directory, args, result, common, canonical, round_i
         attempted=row["attempted_optimizer_updates"],
         completed=row["actual_optimizer_updates"],
         skipped=row["skipped_optimizer_updates"],
+        fresh_training_gradients=row["fresh_training_gradients"],
         clock_samples={key: row["blocks"][0][key] for key in ("gpu_clocks_before", "gpu_clocks_after")},
     )
     if row.get("cuda_tuning_metadata"):
@@ -329,6 +335,11 @@ def main():
     parser.add_argument("--actions", type=int, default=37)
     parser.add_argument("--num-envs", type=int, default=1024)
     parser.add_argument("--batch-size", type=int, default=2048)
+    parser.add_argument(
+        "--fresh-training-gradients",
+        action="store_true",
+        help="Use verified private residual gradient overwrites/reduced clears in both native AMP recipes only.",
+    )
     parser.add_argument("--target-min-wins", type=int, default=7)
     parser.add_argument("--target-median-ratio", type=float, default=0.97)
     args = parser.parse_args()
@@ -357,6 +368,9 @@ def main():
         "protocol": "fresh-process-williams-four-recipe-v1",
         "scope": "Synthetic complete learner updates; no physics or policy-quality measurement",
         "arguments": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
+        "recipe_fresh_training_gradients": {
+            label: args.fresh_training_gradients and backend == "native" for label, (backend, _, _) in RECIPES.items()
+        },
         "orchestrator_source": {"path": str(Path(__file__).resolve()), "sha256": sha(Path(__file__))},
         "worker_source": {"path": str(worker), "sha256": sha(worker)},
         "cache_policy": "Preconditioning workers exercise every recipe first. Disk compiler caches are shared; each fresh tuned worker selects its own algorithms during setup. No independent cold-start comparison.",

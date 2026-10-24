@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Reuse consumer-owned FP16 buffers at private native FlashSAC BatchNorm/dense
+  edges, preserving FP32 outputs, accumulated adjoints and explicit-conversion rounding.
+- Add opt-in `fresh_training_gradients` for verified private residual adjoints,
+  with ownership checks, ordinary accumulation/full-clear fallback and host activation
+  metadata. Keep complete clearing by default; expose the option in balanced comparisons.
+
 - Align optional Torch FlashSAC compilation with the authors' categorical and
   reward helpers while preserving the eager path and per-transition discounts.
 
