@@ -10,6 +10,7 @@ No simulator is imported, and timings do not measure learning quality.
 
 import argparse
 import ast
+import csv
 import hashlib
 import importlib
 import importlib.metadata
@@ -17,6 +18,7 @@ import io
 import json
 import os
 import platform
+import subprocess
 import sys
 import time
 import traceback
@@ -286,6 +288,61 @@ def optimizer_steps(agent):
     return steps
 
 
+def fresh_optimizer_state(agent):
+    """Record that a worker starts before any learner or optimizer update."""
+    native = isinstance(agent, WarpFlashSAC)
+    record = {"agent_update_calls": agent._update_step, "optimizer_steps": optimizer_steps(agent)}
+    if native:
+        optimizers = (agent.actor_optimizer, agent.critic_optimizer, agent.temperature_optimizer)
+        moments = [array for optimizer in optimizers for array in (*optimizer._m1, *optimizer._m2)]
+        record["adam_moment_arrays"] = len(moments)
+        record["adam_moments_zero"] = all(not np.count_nonzero(array.numpy()) for array in moments)
+        record["amp_state"] = native_amp_state(agent)
+        scaler_fresh = all(
+            state["attempted_steps"] == state["skipped_steps"] == state["scale_growth_tracker"] == 0
+            for state in record["amp_state"].values()
+        )
+        fresh = record["adam_moments_zero"] and scaler_fresh
+    else:
+        record["optimizer_state_entries"] = {
+            name: len(getattr(agent, f"_{name}").optimizer.state) for name in ("actor", "critic", "temperature")
+        }
+        record["amp_state"] = agent._grad_scaler.state_dict()
+        fresh = (
+            not any(record["optimizer_state_entries"].values()) and record["amp_state"].get("_growth_tracker", 0) == 0
+        )
+    record["accepted"] = bool(fresh and agent._update_step == 0 and not any(record["optimizer_steps"].values()))
+    if not record["accepted"]:
+        raise RuntimeError("Worker learner/Adam/scaler state is not fresh before warmup")
+    return record
+
+
+def completed_update_budget(agent, calls, actor_period):
+    """Audit cumulative complete work outside the timed update interval."""
+    actor_calls = (calls + actor_period - 1) // actor_period
+    expected = {"critic": calls, "actor": actor_calls, "temperature": actor_calls}
+    actual = optimizer_steps(agent)
+    record = {
+        "expected_agent_update_calls": calls,
+        "actual_agent_update_calls": agent._update_step,
+        "expected_optimizer_steps": expected,
+        "actual_optimizer_steps": actual,
+        "accepted": agent._update_step == calls and actual == expected,
+    }
+    if isinstance(agent, WarpFlashSAC):
+        record["device_update_counters_critic_actor_temperature"] = agent.update_counters.numpy().tolist()
+        record["amp_state"] = native_amp_state(agent)
+        record["accepted"] = bool(
+            record["accepted"]
+            and record["device_update_counters_critic_actor_temperature"] == [calls, actor_calls, actor_calls]
+            and all(
+                state["attempted_steps"] == expected[name] and state["skipped_steps"] == 0
+                for name, state in record["amp_state"].items()
+            )
+        )
+    return record
+
+
 def replay_state(agent):
     buffer = agent._replay_buffer
     count = len(buffer)
@@ -330,6 +387,31 @@ def timed(call, count, device):
     return (time.perf_counter() - start) / count
 
 
+def clock_snapshot():
+    """Sample container-visible devices outside the measured update interval."""
+    fields = "uuid,clocks.current.sm,clocks.current.memory,temperature.gpu,power.draw,power.limit,utilization.gpu"
+    sample = {"observed_unix": time.time(), "scope": "Container-visible devices; outside update timing"}
+    try:
+        process = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        sample.update(status="RECORDED" if process.returncode == 0 else "UNAVAILABLE", exit_code=process.returncode)
+        if process.returncode == 0:
+            sample["devices"] = [
+                dict(zip(fields.split(","), [item.strip() for item in row], strict=True))
+                for row in csv.reader(process.stdout.splitlines())
+            ]
+        else:
+            sample["reason"] = process.stderr.strip()[:500] or "nvidia-smi returned a nonzero exit code"
+    except (OSError, subprocess.TimeoutExpired, csv.Error, ValueError) as error:
+        sample.update(status="UNAVAILABLE", error=type(error).__name__, reason=str(error))
+    return sample
+
+
 def audit_parameters(initial, final):
     groups = {}
     for name in ("actor", "critic", "temperature"):
@@ -357,6 +439,7 @@ def run_backend(agent, name, args, transitions, common_weights, reference_replay
         "status": "PREPARING",
         "precision": "fp16_dense_fp32_state" if native and cfg.use_amp else "fp16_amp" if cfg.use_amp else "fp32",
         "fused_updates": native and agent.fused_updates,
+        "cuda_autotune": bool(native and getattr(agent, "cuda_autotune", False)),
         "resolved_config": asdict(cfg),
         "network_compile": not native and cfg.use_compile,
         "captured_update": native,
@@ -406,6 +489,7 @@ def run_backend(agent, name, args, transitions, common_weights, reference_replay
         agent.prepare(capture=True)
     torch.cuda.synchronize(device)
     row["preparation_seconds"] = time.perf_counter() - start
+    row["initial_optimizer_state"] = fresh_optimizer_state(agent)
     observations = transitions[-1]["next_observation"]
     native_observations = wp.from_torch(observations, dtype=wp.float32) if native else None
 
@@ -437,13 +521,23 @@ def run_backend(agent, name, args, transitions, common_weights, reference_replay
             update()
         torch.cuda.synchronize(device)
         block["warmup_seconds"] = time.perf_counter() - start
+        if args.require_complete_updates:
+            warmup_calls = block_index * (args.warmup + args.updates) + args.warmup
+            block["post_warmup_budget"] = completed_update_budget(agent, warmup_calls, cfg.actor_update_period)
+            write_json(args.output, result)
+            if not block["post_warmup_budget"]["accepted"]:
+                raise RuntimeError(f"Incomplete warmup optimizer/update budget: {name}")
         block["actor_seconds_per_call"] = timed(actor, args.actor_calls, device)
         steps_before = optimizer_steps(agent)
         amp_before = native_amp_state(agent) if native else {}
         device_counters_before = agent.update_counters.numpy().copy() if native else None
         first_phase = agent._update_step
         metric_keys.clear()
+        if args.record_clocks:
+            block["gpu_clocks_before"] = clock_snapshot()
         block["update_seconds_per_call"] = timed(update, args.updates, device)
+        if args.record_clocks:
+            block["gpu_clocks_after"] = clock_snapshot()
         steps_after = optimizer_steps(agent)
         actor_calls = sum((first_phase + index) % cfg.actor_update_period == 0 for index in range(args.updates))
         attempts = {"actor": actor_calls, "critic": args.updates, "temperature": actor_calls}
@@ -475,6 +569,12 @@ def run_backend(agent, name, args, transitions, common_weights, reference_replay
                 and amp_after[key]["skipped_steps"] - amp_before[key]["skipped_steps"] == attempts[key] - actual[key]
                 for key in amp_after
             )
+        if args.require_complete_updates:
+            total_calls = (block_index + 1) * (args.warmup + args.updates)
+            block["post_measurement_budget"] = completed_update_budget(agent, total_calls, cfg.actor_update_period)
+            write_json(args.output, result)
+            if not block["post_measurement_budget"]["accepted"]:
+                raise RuntimeError(f"Incomplete measured optimizer/update budget: {name}")
         measured_metric_keys.update(metric_keys)
         write_json(args.output, result)
     attempts = {
@@ -493,6 +593,13 @@ def run_backend(agent, name, args, transitions, common_weights, reference_replay
             value["mode"] == "native" for value in row["gradient_zero_plans"].values()
         ):
             raise RuntimeError("Fused native benchmark requires active grouped gradient clears for all phases")
+    if native:
+        if row["cuda_autotune"] != args.cuda_autotune:
+            raise RuntimeError("Native learner autotuning selection differs from the requested flag")
+        metadata = getattr(agent, "cuda_tuning_metadata", None)
+        row["cuda_tuning_metadata"] = metadata() if metadata is not None else {}
+        if args.cuda_autotune and not row["cuda_tuning_metadata"]:
+            raise RuntimeError("Requested native autotuning has no recorded plan metadata")
     row.update(
         actor_seconds_per_call=float(np.median([block["actor_seconds_per_call"] for block in row["blocks"]])),
         update_seconds_per_call=float(np.median([block["update_seconds_per_call"] for block in row["blocks"]])),
@@ -605,6 +712,19 @@ def main():
     parser.add_argument("--recipe", choices=("fp32", "amp"), default="fp32")
     parser.add_argument("--compile-fp32", action="store_true", help="Compile Torch networks without enabling AMP.")
     parser.add_argument(
+        "--backend",
+        choices=("all", "official", "torch-port", "native"),
+        default="all",
+        help="Select one learner for a fresh-process worker; the default compares all learners.",
+    )
+    parser.add_argument("--cuda-autotune", action="store_true", help="Opt into native CUDA dense-plan autotuning.")
+    parser.add_argument("--record-clocks", action="store_true", help="Sample GPU clocks outside each timed block.")
+    parser.add_argument(
+        "--require-complete-updates",
+        action="store_true",
+        help="Require all warmup and measured optimizer attempts to complete without AMP skips.",
+    )
+    parser.add_argument(
         "--native-variants", nargs="+", choices=("fp32", "fp32-fused", "amp", "amp-fused"), default=["fp32"]
     )
     parser.add_argument(
@@ -635,6 +755,11 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.only_native and args.backend not in ("all", "native"):
+        parser.error("--only-native cannot be combined with a different --backend selection.")
+    selected = "native" if args.only_native else args.backend
+    if args.cuda_autotune and selected in ("official", "torch-port"):
+        parser.error("--cuda-autotune requires a native backend row.")
     if args.warmup is None:
         args.warmup = 20 if args.recipe == "amp" else 10
     if args.official_root is None:
@@ -652,6 +777,7 @@ def main():
         "status": "RUNNING",
         "scope": "Synthetic standalone learner components; no physics, rollout learning, or policy-quality results.",
         "arguments": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
+        "backend_selection": selected,
         "benchmark_source": {
             "path": str(Path(__file__).resolve()),
             "sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -663,8 +789,8 @@ def main():
             "Shared fixture generation/export, source import/verification, CPU replay audits, and checkpoint "
             "writing are excluded. Compiler caches are retained; "
             + (
-                "only native variants are timed; official construction/loading/ingestion supplies the reference."
-                if args.only_native
+                "only the selected learner is timed; official construction/loading/ingestion supplies the reference."
+                if selected != "all"
                 else "fixed row order is official, port, native."
             )
         ),
@@ -790,7 +916,7 @@ def main():
         result["transition_fixture"] = {key: array_hash(value) for key, value in flat_fixture.items()}
         transitions = [{key: torch.as_tensor(value, device=device) for key, value in row.items()} for row in fixture]
         result["resolved_configs"] = {"official": asdict(official._cfg)}
-        if args.only_native:
+        if selected in ("torch-port", "native"):
             start = time.perf_counter()
             for transition in transitions:
                 official.process_transition(transition)
@@ -820,6 +946,7 @@ def main():
                 artifact_root,
                 official_startup,
             )
+        if selected in ("all", "torch-port"):
             start = time.perf_counter()
             port = FlashSAC(args.observations, args.actions, num_envs=args.num_envs, cfg=cfg)
             torch.cuda.synchronize(device)
@@ -842,40 +969,42 @@ def main():
             for path in source_root.rglob("*.py")
             if "torch.compile" in path.read_text()
         }
-        stream = wp.Stream(args.device)
-        mirror = wp.stream_to_torch(stream)
-        stream.wait_stream(wp.get_stream(args.device))
-        mirror.wait_stream(torch.cuda.current_stream(device))
-        with wp.ScopedStream(stream, sync_enter=False), torch.cuda.stream(mirror):
-            for variant in dict.fromkeys(args.native_variants):
-                start = time.perf_counter()
-                native = WarpFlashSAC(
-                    args.observations,
-                    args.actions,
-                    num_envs=args.num_envs,
-                    cfg=replace(cfg, use_compile=False, use_amp=variant.startswith("amp")),
-                    dense_backend="cuda",
-                    fused_updates=variant.endswith("-fused"),
-                )
-                torch.cuda.synchronize(device)
-                native_startup = {"construction_seconds": time.perf_counter() - start}
-                name = (
-                    "robolearn_native_cuda"
-                    if variant == "fp32"
-                    else "robolearn_native_cuda_" + variant.replace("-", "_")
-                )
-                run_backend(
-                    native,
-                    name,
-                    args,
-                    transitions,
-                    common_weights,
-                    reference_replay,
-                    result,
-                    artifact_root,
-                    native_startup,
-                )
-                result["resolved_configs"][name] = asdict(native.cfg)
+        if selected in ("all", "native"):
+            stream = wp.Stream(args.device)
+            mirror = wp.stream_to_torch(stream)
+            stream.wait_stream(wp.get_stream(args.device))
+            mirror.wait_stream(torch.cuda.current_stream(device))
+            with wp.ScopedStream(stream, sync_enter=False), torch.cuda.stream(mirror):
+                for variant in dict.fromkeys(args.native_variants):
+                    start = time.perf_counter()
+                    native = WarpFlashSAC(
+                        args.observations,
+                        args.actions,
+                        num_envs=args.num_envs,
+                        cfg=replace(cfg, use_compile=False, use_amp=variant.startswith("amp")),
+                        dense_backend="cuda",
+                        fused_updates=variant.endswith("-fused"),
+                        **({"cuda_autotune": True} if args.cuda_autotune else {}),
+                    )
+                    torch.cuda.synchronize(device)
+                    native_startup = {"construction_seconds": time.perf_counter() - start}
+                    name = (
+                        "robolearn_native_cuda"
+                        if variant == "fp32"
+                        else "robolearn_native_cuda_" + variant.replace("-", "_")
+                    )
+                    run_backend(
+                        native,
+                        name,
+                        args,
+                        transitions,
+                        common_weights,
+                        reference_replay,
+                        result,
+                        artifact_root,
+                        native_startup,
+                    )
+                    result["resolved_configs"][name] = asdict(native.cfg)
         result["status"] = "PASSED"
         write_json(args.output, result)
         print(json.dumps({"status": result["status"], "output": str(args.output)}, allow_nan=False))

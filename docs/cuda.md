@@ -65,6 +65,15 @@ views and preserve Warp's initialization bookkeeping; unsupported or changed
 inventories retain Warp's ordinary clear. BatchNorm reduces backward coefficients
 once per channel before coalesced gradient application, using its existing scratch.
 
+`cuda_autotune=True` additionally measures up to eight cuBLASLt candidates for
+each prepared dense operation. Probes use private scratch arrays before capture,
+preserving caller weights, gradients and RNG state. Replacing the original
+heuristic requires at least a 3% median improvement and two paired timing wins.
+Choices and workspace stay fixed after preparation; `cuda_tuning_metadata()`
+returns their host-side records. This option defaults to false. Scratch-GEMM
+timings can rank algorithms differently from a complete learner, so measure the
+full update and include tuning in separately reported startup costs.
+
 The options are independent: leave `use_amp=False` for a fusion-only experiment,
 or `fused_updates=False` to measure mixed precision with the original Warp
 normalization. The default remains FP32 with fusion disabled. Restore the same
@@ -174,6 +183,18 @@ Report compilation/preparation separately from warmed update time. Compare a
 full optimizer step, not only inference or one GEMM, and report precision, shapes,
 attempted/completed updates and numerical health. Synthetic timings establish
 neither walking quality nor time to a trained policy. No speedup is promised.
+
+For repeated comparisons, `examples/benchmark_flashsac_balanced.py` starts a
+fresh worker process for every recipe and round. Two shuffled four-round
+Williams blocks balance positions and preceding recipes for official Torch AMP,
+the Torch port, and native CUDA with and without plan tuning. Preconditioning
+workers warm shared compiler caches; each tuned worker still chooses its own
+plans during preparation. All workers load identical canonical weights and
+fixtures, begin with empty optimizer state, and retain checkpoints and raw
+outcomes. Pass `--rounds 8 --warmup 100 --updates 500 --actor-calls 100`, an
+`--official-root` checkout, shared `--initial-weights`, and a fresh `--output`
+path. Repeat on separate allocations with recorded schedule seeds. These are
+timing repetitions, rather than independent task-learning seeds.
 
 ### Matched FlashSAC follow-up, 24 October 2026
 

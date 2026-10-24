@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Align optional Torch FlashSAC compilation with the authors' categorical and
+  reward helpers while preserving the eager path and per-transition discounts.
+
+- Add opt-in preparation-time cuBLASLt plan tuning with private scratch buffers,
+  fixed captured choices, and recorded candidate timings. Add a balanced
+  fresh-process FlashSAC comparison with matched initialization and update counts.
+
 - Batch experimental native FlashSAC adjoint clears with verified persistent
   pointer inventories and reduce BatchNorm backward coefficients once per channel.
 
