@@ -917,8 +917,8 @@ def fresh_gradient_primitives(report, rng):
                 return {
                     "output": output.numpy().copy(),
                     "dx": sources[index].grad.numpy().copy(),
-                    "dw": norms[index].weight.grad.numpy().copy(),
-                    "db": norms[index].bias.grad.numpy().copy(),
+                    "dw": norms[index].weight.data.grad.numpy().copy(),
+                    "db": norms[index].bias.data.grad.numpy().copy(),
                 }
 
             reference = values(0, run(0))
@@ -1101,9 +1101,7 @@ def fresh_gradient_primitives(report, rng):
         raw = layer(probe)
         output = norm(raw)
     original_gradient = raw.grad
-    parameter_arrays = {
-        str(i): value for i, value in enumerate(fresh.parameters() + [p.data for p in norm.parameters()])
-    }
+    parameter_arrays = {str(i): value for i, value in enumerate(fresh.parameters() + norm.parameters())}
     before_parameters = snapshot(parameter_arrays)
     before_counters = snapshot(
         {
