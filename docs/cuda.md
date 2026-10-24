@@ -1,8 +1,9 @@
 # Experimental native CUDA learning kernels
 
 This optional backend targets the dense arithmetic shared by Warp PPO and Warp
-FlashSAC. It preserves their network architectures, loss kernels, normalization,
-replay/GAE, update order, clipping and checkpoint arrays. Defaults remain Warp.
+FlashSAC. It preserves their network architectures, loss and normalization
+equations, replay/GAE, update order, clipping and checkpoint arrays. Defaults
+remain Warp.
 
 ## Scope
 
@@ -76,7 +77,7 @@ benchmarks support `--compile-fp32`, `--native-variants fp32 fp32-fused amp amp-
 and `--profile-native`; profiler work is outside measured update time and restores
 the learner afterward. Performance and task-learning quality require measurements.
 
-This is a short sequence of GPU kernels captured as a graph. FlashSAC's batch
+This is a sequence of GPU kernels captured as a graph. FlashSAC's batch
 normalization, parameter-gradient reductions and optimizer dependencies limit
 whole-network fusion. Its existing residual blocks and categorical critics are
 retained. Replay and remaining loss kernels use Warp. Dense products,
@@ -127,7 +128,10 @@ see the existing [PPO](warp.md) and [FlashSAC](warp_flashsac.md) guides.
 Use `ppo.warmup()` or `sac.prepare(capture=True)` before timing or outer capture.
 Every inference/training shape must be exercised before capturing it. Keep the
 learners and their native plans alive for the lifetime of dependent graphs.
-Checkpoints restore arrays in place, retaining graph pointer addresses.
+Construct each native learner on its intended CUDA device. Native layers,
+prepared plans and captured graphs have fixed device and buffer ownership;
+device migration with `.to()` is unsupported. Checkpoints restore arrays in
+place, retaining graph pointer addresses.
 
 Compilation is lazy on first native preparation. To compile without using a GPU:
 
@@ -170,6 +174,65 @@ Report compilation/preparation separately from warmed update time. Compare a
 full optimizer step, not only inference or one GEMM, and report precision, shapes,
 attempted/completed updates and numerical health. Synthetic timings establish
 neither walking quality nor time to a trained policy. No speedup is promised.
+
+### Matched FlashSAC follow-up, 24 October 2026
+
+Source: [`69941d3`](https://github.com/maxkra15/RoboLearn/commit/69941d39ef987f43a9052a576b1f679ce4db2a05),
+compared with the preceding native implementation
+[`33c5ba9`](https://github.com/maxkra15/RoboLearn/commit/33c5ba95cb02ae1c74e56b20b3489cacc5be8d10)
+and the unmodified official FlashSAC commit pinned below. One fresh L40 allocation
+uses the same G1-shaped networks, batch size 2,048, and runtime versions below.
+No compiler-cache archive is imported. These are synthetic learner measurements.
+
+Each row contains five continuous-state blocks of 20 warm and 200 measured calls.
+Times are medians of synchronized block means, including the same host scalar
+metric cadence; compilation, checkpointing and profiling are excluded.
+
+| Implementation | First pass, ms/call | Repeat pass, ms/call |
+| --- | ---: | ---: |
+| Official FlashSAC, compiled FP16 AMP | 4.045 | 3.858 |
+| RoboLearn Torch port, compiled FP16 AMP | 4.206 | 4.007 |
+| Native CUDA, captured FP16 dense / FP32 state | 3.794 | 3.798 |
+
+Native used **1.6--6.2% less median update time** than official Torch AMP across
+the two passes. Their observed block ranges overlap: this is a small, conditional
+median advantage, not evidence of a consistent winner. The preceding native
+implementation measured 3.825 ms before and 3.838 ms after the first comparison;
+the additional grouped clears and BatchNorm changes improved native time by
+about 1%. A native strict-FP32 control measured 6.129 ms. The earlier
+weight-copy and categorical optimizations reduced native AMP time from
+4.464--4.467 ms to 3.828 ms in a separate matched allocation.
+
+All nine timing rows completed 1,000 critic, 500 actor and 500 temperature measured
+updates, with zero skips. All four benchmark commands loaded the same 89 canonical
+initial arrays exactly and used bit-identical transition fixtures. Twelve focused
+diagnostic stages passed, including numerical primitives, overflow handling,
+aliased-gradient clearing, eager/captured execution, exact checkpoint restoration
+and continued graph replay. Complete-learner floating drift remains descriptive
+under the recorded sanity gates, rather than strict Torch/native equivalence.
+All optimized native clear plans were active; the focused continuation checks
+confirmed their adjoints were zero.
+
+The native recipe retains FP32 intermediates and separate actor/critic scales;
+Torch autocast rounds more intermediates and uses a shared scaler. Torch permits
+TF32 in this AMP recipe; native does not. Rows and processes run in fixed order
+with shared caches, so the blocks are not independent runs or confidence
+intervals. Official first-pass startup took 444 seconds including compilation
+and autotuning; native preparation followed the diagnostic and preceding-native
+processes and is not an independently cold startup comparison. No environment
+learning, walking quality or end-to-end simulator speed was measured.
+
+Reproduce with [the focused diagnostic](../examples/diagnose_cuda_flashsac.py)
+and [the official comparison](../examples/benchmark_official_flashsac.py). Pass
+`--official-root <pristine-87edc90-checkout> --output <fresh-result>.json`, using
+`--recipe amp --allow-tf32 --blocks 5 --warmup 20 --updates 200 --actor-calls 100`,
+`--native-variants amp-fused fp32-fused --profile-native` for the first pass,
+and `--native-variants amp-fused` for the repeat. The first invocation saves
+`common-initial-weights.npz` in its artifact directory; pass that same file with
+`--initial-weights` to subsequent commands. To bracket the first comparison,
+run the current driver with `PYTHONPATH` pointing to the pinned `33c5ba9/src`
+and `--only-native --native-variants amp-fused` before and after it. The backend
+remains experimental pending policy-learning checks.
 
 ### L40 measurements, 23 October 2026
 

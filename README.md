@@ -6,7 +6,7 @@ Small reinforcement learning implementations for GPU robot simulation.
 | --- | --- | --- |
 | `robolearn.flashsac.FlashSAC` | Authors' Torch implementation, including compilation and AMP | Recommended FlashSAC backend |
 | `robolearn.warp.WarpPPO` | Fixed buffers and capturable Warp-NN PPO updates | Single-GPU state observations |
-| `robolearn.warp.WarpFlashSAC` | FP32 Warp-NN port | Experimental; slower in current learner benchmarks |
+| `robolearn.warp.WarpFlashSAC` | Warp-NN FP32; optional native CUDA FP32 or mixed precision | Experimental; measure the selected recipe and task |
 
 Isaac Lab owns simulation, rollout collection, and experiment logging. RoboLearn
 owns policy inference, learning, and native learner checkpoints. The package
@@ -54,9 +54,12 @@ checkpointing. See [the Isaac Lab guide](docs/isaaclab.md) and
 
 The experimental `robolearn.warp.WarpFlashSAC` backend uses the same configuration,
 authors' residual networks, categorical critics, and update order. It accepts Warp
-arrays and captures replay sampling and learning updates. Start with FP32 to check
-numerical fidelity; mixed precision is not implemented. See the
-[Warp FlashSAC guide](docs/warp_flashsac.md) for scope and validation status.
+arrays and captures replay sampling and learning updates. The default Warp-NN
+backend uses FP32. The optional native CUDA backend supports FP16 dense operands
+with FP32 activations, master weights and optimizer state, plus kernel fusions.
+See the [Warp FlashSAC guide](docs/warp_flashsac.md) and
+[CUDA guide](docs/cuda.md) for scope and validation status. Torch remains the
+recommended FlashSAC backend pending native policy-learning validation.
 Construction emits a `RuntimeWarning` identifying the experimental backend;
 existing imports and checkpoint formats remain available.
 
