@@ -30,6 +30,8 @@ Adaptations in this extraction:
   type aliases; added a dimensions-based Python API and configuration defaults.
 - Kept policy actions and transitions as PyTorch tensors on the device.
 - Made compilation opt-in and stored raw model state for eager/compiled checkpoint interoperability.
+- Match the authors' default-mode compilation of categorical and reward helpers
+  when enabled, with per-instance wrappers so eager agents remain independent.
 - Reset episode accumulators when loading reward statistics into a different environment count.
 - Stored effective bootstrap discounts for n-step returns interrupted by timeouts.
 - Added an Isaac Lab 3 adapter with pre-reset terminal observations.

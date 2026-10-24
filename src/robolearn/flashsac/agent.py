@@ -7,7 +7,8 @@ import json
 import math
 import os
 from dataclasses import asdict, replace
-from typing import Any, MutableMapping, Optional, cast
+from functools import partial
+from typing import Any, Callable, MutableMapping, Optional, cast
 
 import gymnasium as gym
 import torch
@@ -27,6 +28,8 @@ from robolearn.flashsac.networks import (
 )
 from robolearn.flashsac.replay import TorchUniformBuffer
 from robolearn.flashsac.updates import (
+    _compute_categorical_td_target,
+    _select_min_q_log_probs,
     update_actor,
     update_critic,
     update_target_network,
@@ -221,6 +224,7 @@ def _update_networks(
     do_actor_update: bool,
     device: torch.device,
     grad_scaler: Optional[GradScaler],
+    critic_update: Callable[..., dict[str, torch.Tensor]] = update_critic,
 ) -> dict[str, torch.Tensor]:
     if do_actor_update:
         # Update actor
@@ -246,7 +250,7 @@ def _update_networks(
         temperature_info = {}
 
     # Update critic
-    critic_info = update_critic(
+    critic_info = critic_update(
         actor=actor,  # updated
         critic=critic,
         target_critic=target_critic,
@@ -359,6 +363,18 @@ class FlashSAC(BaseAgent[FlashSACConfig]):
         self._sample_actions = (
             torch.compile(_sample_flashsac_actions, mode=compile_mode) if cfg.use_compile else _sample_flashsac_actions
         )
+        # Authors compile these pure Tensor helpers in the default mode, even
+        # when networks use max-autotune. Keep opt-in wrappers local to this
+        # agent so eager agents and module-level functions remain untouched.
+        self._critic_update = (
+            partial(
+                update_critic,
+                select_min_q_log_probs=torch.compile(_select_min_q_log_probs),
+                categorical_td_target=torch.compile(_compute_categorical_td_target),
+            )
+            if cfg.use_compile
+            else update_critic
+        )
 
         # Grad scaler for FP16 AMP
         self._grad_scaler = GradScaler(device=self._device.type, enabled=self._cfg.use_amp)
@@ -380,6 +396,7 @@ class FlashSAC(BaseAgent[FlashSACConfig]):
                 G_max=self._cfg.normalized_G_max,
                 load_rms=self._cfg.load_reward_normalizer,
                 device=self._device,
+                compile_helpers=cfg.use_compile,
             )
 
         # Replay buffer
@@ -488,6 +505,7 @@ class FlashSAC(BaseAgent[FlashSACConfig]):
             do_actor_update=(self._update_step % self._cfg.actor_update_period == 0),
             device=self._device,
             grad_scaler=self._grad_scaler,
+            critic_update=self._critic_update,
         )
         self._update_step += 1
 
