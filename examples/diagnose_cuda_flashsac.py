@@ -514,6 +514,153 @@ def normalization(report, rng):
         np.savez(report.artifacts / f"normalization-{label}.npz", **eager)
 
 
+def normalization_fp16_input(report, rng):
+    """Compare producer rounding with the existing standalone dense input cast."""
+    from robolearn.cuda import CudaBatchNorm, CudaLinear
+
+    batch, channels, outgoing = 17, 19, 23
+    x = rng.normal(0, 0.3, (batch, channels)).astype(np.float32)
+    w = rng.normal(0, 0.2, (outgoing, channels)).astype(np.float32)
+    b = rng.normal(0, 0.1, outgoing).astype(np.float32)
+    dy = wp.array(rng.normal(0, 0.2, (batch, outgoing)).astype(np.float32))
+    for relu in (False, True):
+        for training in (False, True):
+            label = f"relu{int(relu)}-training{int(training)}"
+            norms = [CudaBatchNorm(channels, relu=relu, eps=1e-5, momentum=0.01) for _ in range(2)]
+            layers = [CudaLinear(channels, outgoing, compute_dtype="float16") for _ in range(2)]
+            sources = [wp.array(x, requires_grad=True) for _ in range(2)]
+            for norm, layer in zip(norms, layers, strict=True):
+                norm.train(training)
+                layer.weight.data.assign(w)
+                layer.bias.data.assign(b[:, None])
+                layer.prepare(batch)
+            initial = [snapshot(norm.state_dict()) for norm in norms]
+            shadow = layers[1].input_fp16_buffer(batch)
+            shadow_pointer = shadow.ptr
+
+            def run(index, fused):
+                norm, layer, source = norms[index], layers[index], sources[index]
+                source.grad.zero_()
+                for module in (norm, layer):
+                    for parameter in module.parameters():
+                        if parameter.grad is not None:
+                            parameter.grad.zero_()
+                with wp.Tape() as tape:
+                    normalized = norm(source, output_fp16=shadow if fused else None)
+                    output = layer(normalized, input_fp16=shadow if fused else None)
+                normalized.grad.zero_()
+                output.grad.zero_()
+                tape.backward(grads={output: dy})
+                return normalized, output
+
+            def state(index, outputs):
+                normalized, output = outputs
+                result = {
+                    "normalized": normalized.numpy().copy(),
+                    "output": output.numpy().copy(),
+                    "dx": sources[index].grad.numpy().copy(),
+                }
+                for name, module in (("norm", norms[index]), ("linear", layers[index])):
+                    result.update({f"{name}.{key}": value for key, value in snapshot(module.state_dict()).items()})
+                    result.update(
+                        {
+                            f"{name}.gradient.{i}": parameter.grad.numpy().copy()
+                            for i, parameter in enumerate(module.parameters())
+                            if parameter.grad is not None
+                        }
+                    )
+                return result
+
+            reference = state(0, run(0, False))
+            shadow.fill_(-123.0)
+            eager_outputs = run(1, True)
+            eager = state(1, eager_outputs)
+            report.arrays(f"{label}/producer_fp32", eager["normalized"], reference["normalized"], exact=True)
+            report.arrays(
+                f"{label}/producer_rounding", shadow.numpy(), eager["normalized"].astype(np.float16), exact=True
+            )
+            for name in reference:
+                report.arrays(f"{label}/eager/{name}", eager[name], reference[name])
+            restore(norms[1].state_dict(), initial[1])
+            choices = json.dumps(layers[1].tuning_metadata, sort_keys=True)
+            with wp.ScopedCapture() as capture:
+                outputs = run(1, True)
+            for index in range(2):
+                restore(norms[1].state_dict(), initial[1])
+                shadow.fill_(-123.0)
+                wp.capture_launch(capture.graph)
+                captured = state(1, outputs)
+                for name in reference:
+                    report.arrays(f"{label}/capture{index}/{name}", captured[name], reference[name])
+                report.arrays(
+                    f"{label}/capture{index}/rounding",
+                    shadow.numpy(),
+                    captured["normalized"].astype(np.float16),
+                    exact=True,
+                )
+            report.check(
+                f"{label}/owned_pointer_and_plans_retained",
+                shadow.ptr == layers[1].input_fp16_buffer(batch).ptr == shadow_pointer
+                and json.dumps(layers[1].tuning_metadata, sort_keys=True) == choices,
+            )
+            parameters = norms[1].parameters() + layers[1].parameters()
+            gradients = [parameter.grad for parameter in parameters]
+            try:
+                for parameter in parameters:
+                    parameter.grad = None
+                restore(norms[1].state_dict(), initial[1])
+                frozen = state(1, run(1, True))
+                report.arrays(f"{label}/frozen_input_gradient", frozen["dx"], reference["dx"])
+            finally:
+                for parameter, gradient in zip(parameters, gradients, strict=True):
+                    parameter.grad = gradient
+            foreign = wp.empty_like(shadow)
+            try:
+                layers[1](sources[1], input_fp16=foreign)
+            except ValueError:
+                report.check(f"{label}/foreign_shadow_rejected", True)
+            else:
+                report.check(f"{label}/foreign_shadow_rejected", False)
+            np.savez(
+                report.artifacts / f"normalization-fp16-input-{label}.npz",
+                **{f"reference.{key}": value for key, value in reference.items()},
+                **{f"eager.{key}": value for key, value in eager.items()},
+                source=x,
+                shadow=shadow.numpy(),
+            )
+    # Two rows make every matching FP16 view fit even a C-element FP32
+    # parameter/statistic buffer. No invalid-capacity pointer is dereferenced.
+    alias_input = wp.array(x[:2].copy(), requires_grad=True)
+    alias_norm = CudaBatchNorm(channels)
+    alias_norm(alias_input)
+    output, mean, variance, partial, sums = alias_norm._cache[alias_input.shape]
+    sums.zero_()  # Forward leaves this backward-only scratch uninitialized.
+    active = {
+        "input": alias_input,
+        "output": output,
+        "mean": mean,
+        "variance": variance,
+        "partial": partial,
+        "sums": sums,
+        **alias_norm.state_dict(),
+    }
+    for name, array in tuple(active.items()):
+        if array.grad is not None:
+            array.grad.zero_()
+            active[f"{name}.grad"] = array.grad
+    before = snapshot(active)
+    for name, array in active.items():
+        alias = wp.array(ptr=array.ptr, dtype=wp.float16, shape=alias_input.shape, device=array.device)
+        try:
+            alias_norm(alias_input, output_fp16=alias)
+        except ValueError as error:
+            report.check(f"alias/{name}/rejected", "overlap" in str(error))
+        else:
+            report.check(f"alias/{name}/rejected", False)
+    for name, value in snapshot(active).items():
+        report.arrays(f"alias/{name}/unchanged", value, before[name], exact=True)
+
+
 def categorical(report, rng, bins=101):
     from robolearn.cuda.categorical import CudaCategorical, categorical_target
     from robolearn.warp.flashsac import _categorical_target
@@ -874,6 +1021,7 @@ def main():
                 ("grouped-zero", grouped_zero),
                 ("projection-ema", projection_ema),
                 ("normalization", normalization),
+                ("normalization-fp16-input", normalization_fp16_input),
                 ("categorical", categorical),
                 ("categorical-wide", lambda report, rng: categorical(report, rng, bins=257)),
             ):

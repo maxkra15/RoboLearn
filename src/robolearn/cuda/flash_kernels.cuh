@@ -23,6 +23,9 @@
 // Allocation-free normalization ABI (row-major B x C, all arrays FP32):
 // int rl_flash_bn_forward(x,w,b,running_mean,running_var,mean,var,partial,y,
 //     int B,int C,float eps,float momentum,int training,int relu,void* stream);
+// int rl_flash_bn_forward_with_fp16(...same nine FP32 arrays...,half_output,
+//     int B,int C,float eps,float momentum,int training,int relu,void* stream);
+// Optional half_output is exact FP16 rounding of the retained FP32 y.
 // int rl_flash_bn_backward(x,dy,y,w,mean,var,partial,sums,dx,dw,db,
 //     int B,int C,float eps,int training,int relu,void* stream);
 // int rl_flash_rms_forward(x,w,var,y,int B,int C,float eps,void* stream);
@@ -203,8 +206,10 @@ __global__ void bn_statistics(const float* partial, float* mean, float* variance
     }
 }
 
+template <bool WriteHalf>
 __global__ void bn_apply(const float* x, const float* weight, const float* bias, const float* mean,
-                         const float* variance, float* output, int batch, int channels, float eps, bool relu) {
+                         const float* variance, float* output, __half* half_output,
+                         int batch, int channels, float eps, bool relu) {
     const int lane = threadIdx.x % Channels, group = threadIdx.x / Channels;
     const int channel = blockIdx.x * Channels + lane;
     __shared__ float averages[Channels], deviations[Channels], weights[Channels], biases[Channels];
@@ -222,7 +227,9 @@ __global__ void bn_apply(const float* x, const float* weight, const float* bias,
         float value = (x[index] - averages[lane]) / deviations[lane];
         if (weight) value *= weights[lane];
         if (bias) value += biases[lane];
-        output[index] = relu && value <= 0.0f ? 0.0f : value;
+        const float result = relu && value <= 0.0f ? 0.0f : value;
+        output[index] = result;
+        if constexpr (WriteHalf) half_output[index] = __float2half_rn(result);
     }
 }
 
@@ -481,13 +488,14 @@ extern "C" int rl_flash_ema_destroy(void* opaque) noexcept {
     return result;
 }
 
-extern "C" int rl_flash_bn_forward(const float* x, const float* w, const float* b, float* running_mean, float* running_var,
-                                    float* mean, float* var, float* partial, float* y, int batch, int channels,
-                                    float eps, float momentum, int training, int relu, void* stream) noexcept {
+static int flash_bn_forward(const float* x, const float* w, const float* b, float* running_mean, float* running_var,
+                            float* mean, float* var, float* partial, float* y, __half* half_output,
+                            int batch, int channels, float eps, float momentum, int training, int relu, void* stream) noexcept {
     last_error[0] = '\0';
     if (!flash_native::dimensions(batch, channels, eps)) return -1;
     if (!x || !y || !mean || !var || !partial || (!training && (!running_mean || !running_var)) ||
         (training && running_mean && batch < 2)) { set_error("Invalid BN forward arrays/count."); return -1; }
+    if (half_output && !aligned(half_output, alignof(__half))) { set_error("Invalid FP16 BN output alignment."); return -1; }
     const cudaStream_t st = reinterpret_cast<cudaStream_t>(stream);
     const int chunks = (batch + flash_native::Chunk - 1) / flash_native::Chunk;
     if (training) {
@@ -497,9 +505,32 @@ extern "C" int rl_flash_bn_forward(const float* x, const float* w, const float* 
                                                                         batch, channels, chunks, momentum);
     }
     const dim3 apply_grid((channels + 31) / 32, (batch + flash_native::ApplyRows - 1) / flash_native::ApplyRows);
-    flash_native::bn_apply<<<apply_grid, 256, 0, st>>>(x, w, b, training ? mean : running_mean,
-                                                     training ? var : running_var, y, batch, channels, eps, relu != 0);
+    const float* selected_mean = training ? mean : running_mean;
+    const float* selected_variance = training ? var : running_var;
+    if (half_output) {
+        flash_native::bn_apply<true><<<apply_grid, 256, 0, st>>>(x, w, b, selected_mean, selected_variance,
+            y, half_output, batch, channels, eps, relu != 0);
+    } else {
+        flash_native::bn_apply<false><<<apply_grid, 256, 0, st>>>(x, w, b, selected_mean, selected_variance,
+            y, nullptr, batch, channels, eps, relu != 0);
+    }
     return flash_native::launched("Run FlashSAC BatchNorm forward");
+}
+
+extern "C" int rl_flash_bn_forward(const float* x, const float* w, const float* b, float* running_mean, float* running_var,
+                                    float* mean, float* var, float* partial, float* y, int batch, int channels,
+                                    float eps, float momentum, int training, int relu, void* stream) noexcept {
+    return flash_bn_forward(x, w, b, running_mean, running_var, mean, var, partial, y, nullptr,
+                            batch, channels, eps, momentum, training, relu, stream);
+}
+
+extern "C" int rl_flash_bn_forward_with_fp16(const float* x, const float* w, const float* b,
+                                              float* running_mean, float* running_var, float* mean, float* var,
+                                              float* partial, float* y, __half* half_output, int batch, int channels,
+                                              float eps, float momentum, int training, int relu, void* stream) noexcept {
+    if (!half_output) { set_error("FP16 BN output must be nonnull."); return -1; }
+    return flash_bn_forward(x, w, b, running_mean, running_var, mean, var, partial, y, half_output,
+                            batch, channels, eps, momentum, training, relu, stream);
 }
 
 extern "C" int rl_flash_bn_backward(const float* x, const float* dy, const float* y, const float* w,

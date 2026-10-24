@@ -196,15 +196,28 @@ class _UnitRMSNorm(RMSNorm):
         wp.launch(_normalize_scale, dim=1, inputs=[self.weight.data], device=self.device)
 
 
+def _normalized_linear(norm, linear, input, fused):
+    """Share an explicit consumer-owned FP16 input buffer on the fused AMP path."""
+    if fused:
+        from robolearn.cuda import CudaBatchNorm, CudaLinear
+
+        consumer = linear.w
+        if isinstance(norm, CudaBatchNorm) and isinstance(consumer, CudaLinear) and consumer.compute_dtype == "float16":
+            shadow = consumer.input_fp16_buffer(input.shape[0])
+            return consumer(norm(input, output_fp16=shadow), input_fp16=shadow)
+    return linear(norm(input))
+
+
 class _Embedder(nn.Module):
     def __init__(self, input_dim, hidden_dim, rng, linear, requires_grad, fused=False):
         super().__init__(requires_grad=requires_grad)
         self.norm = _batch_norm(input_dim, requires_grad, fused)
         self.w = _UnitLinear(input_dim, hidden_dim, rng, linear, requires_grad)
+        self.fused = fused
         super().__post_init__()
 
     def __call__(self, input: wp.array) -> wp.array:
-        return self.w(self.norm(input))
+        return _normalized_linear(self.norm, self.w, input, self.fused)
 
 
 class _ResidualBlock(nn.Module):
@@ -221,10 +234,12 @@ class _ResidualBlock(nn.Module):
         super().__post_init__()
 
     def __call__(self, input: wp.array) -> wp.array:
-        output = self.norm1(self.w1(input))
-        if not self.fused:
-            output = self.relu1(output)
-        output = self.norm2(self.w2(output))
+        output = self.w1(input)
+        if self.fused:
+            output = _normalized_linear(self.norm1, self.w2, output, True)
+        else:
+            output = self.w2(self.relu1(self.norm1(output)))
+        output = self.norm2(output)
         if not self.fused:
             output = self.relu2(output)
         return self.add(output, input)

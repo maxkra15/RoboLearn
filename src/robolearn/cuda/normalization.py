@@ -52,10 +52,26 @@ class CudaBatchNorm(nn.BatchNorm):
         self.fused_relu = bool(relu)
         self._native_library = None
 
-    def __call__(self, input):
+    def __call__(self, input, *, output_fp16=None):
+        """Retain FP32 output and optionally fill a caller-owned FP16 consumer buffer.
+
+        The optional buffer receives exact FP16 rounding after affine/ReLU in
+        the same kernel. It has no adjoint or normalization state; backward
+        continues to use the owned FP32 output and existing FP32 statistics.
+        It must not overlap this operation's FP32 buffers or adjoints. The caller retains
+        the buffer and its consuming layer through all dependent graph replays.
+        """
         _input(self, input)
         if input.shape[1] != self.num_features:
             raise ValueError("Input channel count differs from CudaBatchNorm.num_features")
+        if output_fp16 is not None and (
+            not isinstance(output_fp16, wp.array)
+            or output_fp16.dtype != wp.float16
+            or output_fp16.device != self.device
+            or not output_fp16.is_contiguous
+            or output_fp16.shape != input.shape
+        ):
+            raise ValueError("output_fp16 must be a contiguous matching FP16 matrix on this CUDA device")
         training = self.training or not self.track_running_stats
         if self.training and input.shape[0] <= 1:
             raise ValueError("BatchNorm training requires more than one value per channel")
@@ -75,17 +91,26 @@ class CudaBatchNorm(nn.BatchNorm):
         output, mean, variance, partial, sums = self._cache[shape]
         weight, bias = _data(self.weight), _data(self.bias)
         running_mean, running_var = _data(self.running_mean), _data(self.running_var)
+        if output_fp16 is not None:
+            begin = output_fp16.ptr
+            end = begin + output_fp16.size * 2
+            for array in (input, output, mean, variance, partial, sums, weight, bias, running_mean, running_var):
+                if array is not None:
+                    for value in (array, array.grad):
+                        if value is not None and begin < value.ptr + value.size * 4 and value.ptr < end:
+                            raise ValueError("output_fp16 must not overlap BatchNorm's active FP32 buffers or adjoints")
         with wp.ScopedDevice(self.device):
             if self._native_library is None:
                 self._native_library = _library(self.device)
             library = self._native_library
+            forward = library.rl_flash_bn_forward if output_fp16 is None else library.rl_flash_bn_forward_with_fp16
+            arrays = (input, weight, bias, running_mean, running_var, mean, variance, partial, output)
+            if output_fp16 is not None:
+                arrays += (output_fp16,)
             check(
                 library,
-                library.rl_flash_bn_forward(
-                    *(
-                        pointer(value)
-                        for value in (input, weight, bias, running_mean, running_var, mean, variance, partial, output)
-                    ),
+                forward(
+                    *(pointer(value) for value in arrays),
                     *shape,
                     self.eps,
                     self.momentum,

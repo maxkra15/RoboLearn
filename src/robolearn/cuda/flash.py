@@ -27,6 +27,7 @@ def _library(device):
         "ema_step": ([p, p], i),
         "ema_destroy": ([p], i),
         "bn_forward": ([p] * 9 + [i, i, f, f, i, i, p], i),
+        "bn_forward_with_fp16": ([p] * 10 + [i, i, f, f, i, i, p], i),
         "bn_backward": ([p] * 11 + [i, i, f, i, i, p], i),
         "rms_forward": ([p] * 4 + [i, i, f, p], i),
         "rms_backward": ([p] * 7 + [i, i, f, p], i),

@@ -245,7 +245,20 @@ class CudaLinear(nn.Linear):
                 raise
         return self
 
-    def __call__(self, input: wp.array, *, compute_dtype: str | None = None) -> wp.array:
+    def input_fp16_buffer(self, batch_size: int) -> wp.array:
+        """Return this shape's existing conversion buffer for an explicit producer.
+
+        Prepare outside capture. A producer may write exact FP16 rounding of its
+        FP32 output here, then pass this same object as ``input_fp16``. It stays
+        owned by this layer and is reused for dW; the usual single-live-forward
+        per shape contract applies. This adds no storage or checkpoint state.
+        """
+        self.prepare(batch_size, "float16")
+        return self._cuda_plans[(batch_size, "float16")][3][1]
+
+    def __call__(
+        self, input: wp.array, *, compute_dtype: str | None = None, input_fp16: wp.array | None = None
+    ) -> wp.array:
         if input.dtype != wp.float32 or input.ndim != 2 or input.shape[1] != self.in_features:
             raise ValueError("CudaLinear requires float32 input shaped (batch, in_features)")
         if input.device != self.device or not input.is_contiguous:
@@ -254,6 +267,8 @@ class CudaLinear(nn.Linear):
         mode = self.compute_dtype if compute_dtype is None else compute_dtype
         self.prepare(batch, mode)
         plans, workspace, workspace_bytes, converted = self._cuda_plans[(batch, mode)]
+        if input_fp16 is not None and (converted is None or input_fp16 is not converted[1]):
+            raise ValueError("input_fp16 must be this layer's prepared FP16 input buffer for the current batch")
         forward, input_gradient, weight_gradient = plans
         library = forward.library
         output = self._cache[((batch, self.out_features), wp.float32)]
@@ -301,7 +316,8 @@ class CudaLinear(nn.Linear):
                 forward_weight, forward_input, _ = converted
                 if not self._weight_shadow_managed:
                     cast(weight, forward_weight)
-                cast(input, forward_input)
+                if input_fp16 is None:
+                    cast(input, forward_input)
             run(forward, forward_weight, forward_input, output, 0.0, bias)
         if tape is None:
             return output
