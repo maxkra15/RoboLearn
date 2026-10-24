@@ -52,26 +52,31 @@ class CudaBatchNorm(nn.BatchNorm):
         self.fused_relu = bool(relu)
         self._native_library = None
 
-    def __call__(self, input, *, output_fp16=None):
-        """Retain FP32 output and optionally fill a caller-owned FP16 consumer buffer.
+    def __call__(self, input, *, output_fp16=None, input_gradient_fp16=None):
+        """Retain FP32 values and optionally fill explicit consumer-owned FP16 buffers.
 
         The optional buffer receives exact FP16 rounding after affine/ReLU in
         the same kernel. It has no adjoint or normalization state; backward
         continues to use the owned FP32 output and existing FP32 statistics.
-        It must not overlap this operation's FP32 buffers or adjoints. The caller retains
-        the buffer and its consuming layer through all dependent graph replays.
+        ``input_gradient_fp16`` receives the final accumulated FP32 input
+        adjoint, not just this backward contribution. Only declare it where
+        this operation is the final adjoint writer before the preceding dense
+        backward. Buffers must not overlap active FP32 storage or each other.
+        The caller retains them and both layers through all graph replays;
+        the usual single-live-call per shape contract still applies.
         """
         _input(self, input)
         if input.shape[1] != self.num_features:
             raise ValueError("Input channel count differs from CudaBatchNorm.num_features")
-        if output_fp16 is not None and (
-            not isinstance(output_fp16, wp.array)
-            or output_fp16.dtype != wp.float16
-            or output_fp16.device != self.device
-            or not output_fp16.is_contiguous
-            or output_fp16.shape != input.shape
-        ):
-            raise ValueError("output_fp16 must be a contiguous matching FP16 matrix on this CUDA device")
+        for name, buffer in (("output_fp16", output_fp16), ("input_gradient_fp16", input_gradient_fp16)):
+            if buffer is not None and (
+                not isinstance(buffer, wp.array)
+                or buffer.dtype != wp.float16
+                or buffer.device != self.device
+                or not buffer.is_contiguous
+                or buffer.shape != input.shape
+            ):
+                raise ValueError(f"{name} must be a contiguous matching FP16 matrix on this CUDA device")
         training = self.training or not self.track_running_stats
         if self.training and input.shape[0] <= 1:
             raise ValueError("BatchNorm training requires more than one value per channel")
@@ -91,14 +96,25 @@ class CudaBatchNorm(nn.BatchNorm):
         output, mean, variance, partial, sums = self._cache[shape]
         weight, bias = _data(self.weight), _data(self.bias)
         running_mean, running_var = _data(self.running_mean), _data(self.running_var)
-        if output_fp16 is not None:
-            begin = output_fp16.ptr
-            end = begin + output_fp16.size * 2
+        tape = wp._src.context.runtime.tape
+        if input_gradient_fp16 is not None and (tape is None or input.grad is None or output.grad is None):
+            raise ValueError("input_gradient_fp16 requires a taped operation with FP32 input/output adjoints")
+        for name, buffer in (("output_fp16", output_fp16), ("input_gradient_fp16", input_gradient_fp16)):
+            if buffer is None:
+                continue
+            begin = buffer.ptr
+            end = begin + buffer.size * 2
             for array in (input, output, mean, variance, partial, sums, weight, bias, running_mean, running_var):
                 if array is not None:
                     for value in (array, array.grad):
                         if value is not None and begin < value.ptr + value.size * 4 and value.ptr < end:
-                            raise ValueError("output_fp16 must not overlap BatchNorm's active FP32 buffers or adjoints")
+                            raise ValueError(f"{name} must not overlap BatchNorm's active FP32 buffers or adjoints")
+        if output_fp16 is not None and input_gradient_fp16 is not None:
+            if (
+                output_fp16.ptr < input_gradient_fp16.ptr + input_gradient_fp16.size * 2
+                and input_gradient_fp16.ptr < output_fp16.ptr + output_fp16.size * 2
+            ):
+                raise ValueError("FP16 output and input-gradient buffers must not overlap")
         with wp.ScopedDevice(self.device):
             if self._native_library is None:
                 self._native_library = _library(self.device)
@@ -120,32 +136,33 @@ class CudaBatchNorm(nn.BatchNorm):
                 ),
                 "Native BatchNorm forward",
             )
-        tape = wp._src.context.runtime.tape
         if tape is None or output.grad is None:
             return output
         selected_mean, selected_variance = (mean, variance) if training else (running_mean, running_var)
 
         def backward():
             with wp.ScopedDevice(self.device):
+                arrays = (
+                    input,
+                    output.grad,
+                    output,
+                    weight,
+                    selected_mean,
+                    selected_variance,
+                    partial,
+                    sums,
+                    input.grad,
+                    _gradient(weight),
+                    _gradient(bias),
+                )
+                function = library.rl_flash_bn_backward
+                if input_gradient_fp16 is not None:
+                    arrays += (input_gradient_fp16,)
+                    function = library.rl_flash_bn_backward_with_fp16
                 check(
                     library,
-                    library.rl_flash_bn_backward(
-                        *(
-                            pointer(value)
-                            for value in (
-                                input,
-                                output.grad,
-                                output,
-                                weight,
-                                selected_mean,
-                                selected_variance,
-                                partial,
-                                sums,
-                                input.grad,
-                                _gradient(weight),
-                                _gradient(bias),
-                            )
-                        ),
+                    function(
+                        *(pointer(value) for value in arrays),
                         *shape,
                         self.eps,
                         int(training),

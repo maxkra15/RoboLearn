@@ -28,6 +28,8 @@
 // Optional half_output is exact FP16 rounding of the retained FP32 y.
 // int rl_flash_bn_backward(x,dy,y,w,mean,var,partial,sums,dx,dw,db,
 //     int B,int C,float eps,int training,int relu,void* stream);
+// int rl_flash_bn_backward_with_fp16(...same eleven FP32 arrays...,half_dx,
+//     batch,channels,eps,training,relu,stream): round final accumulated dx.
 // int rl_flash_rms_forward(x,w,var,y,int B,int C,float eps,void* stream);
 // int rl_flash_rms_backward(x,dy,w,var,partial,dx,dw,int B,int C,float eps,void* stream);
 // Forward partial/scratch: BN 2*ceil(B/256)*C; RMS var B.
@@ -282,8 +284,10 @@ __global__ void bn_gradient_reduce(const float* partial, float* sums, float* dw,
     if (db) db[channel] += sum;
 }
 
+template <bool WriteHalf>
 __global__ void bn_backward_apply(const float* x, const float* dy, const float* output, const float* weight,
                                   const float* mean, const float* variance, const float* sums, float* dx,
+                                  __half* half_dx,
                                   int batch, int channels, float eps, bool training, bool relu) {
     const int lane = threadIdx.x % Channels, group = threadIdx.x / Channels;
     const int channel = blockIdx.x * Channels + lane;
@@ -306,7 +310,9 @@ __global__ void bn_backward_apply(const float* x, const float* dy, const float* 
         float gradient = relu && output[index] <= 0.0f ? 0.0f : dy[index];
         if (training) gradient = gradient - gradient_means[lane]
             - (x[index] - averages[lane]) * inverses[lane] * normalized_means[lane];
-        dx[index] += weights[lane] * inverses[lane] * gradient;
+        const float updated = dx[index] + weights[lane] * inverses[lane] * gradient;
+        dx[index] = updated;
+        if constexpr (WriteHalf) half_dx[index] = __float2half_rn(updated);
     }
 }
 
@@ -533,13 +539,16 @@ extern "C" int rl_flash_bn_forward_with_fp16(const float* x, const float* w, con
                             batch, channels, eps, momentum, training, relu, stream);
 }
 
-extern "C" int rl_flash_bn_backward(const float* x, const float* dy, const float* y, const float* w,
+static int flash_bn_backward(const float* x, const float* dy, const float* y, const float* w,
                                      const float* mean, const float* var, float* partial, float* sums,
-                                     float* dx, float* dw, float* db, int batch, int channels, float eps,
+                                     float* dx, float* dw, float* db, __half* half_dx, int batch, int channels, float eps,
                                      int training, int relu, void* stream) noexcept {
     last_error[0] = '\0';
     if (!flash_native::dimensions(batch, channels, eps)) return -1;
     if (!x || !dy || !y || !mean || !var || !partial || !sums) { set_error("Invalid BN backward arrays."); return -1; }
+    if (half_dx && (!dx || !aligned(half_dx, alignof(__half)))) {
+        set_error("FP16 BN input adjoint requires aligned storage and a FP32 input adjoint."); return -1;
+    }
     const cudaStream_t st = reinterpret_cast<cudaStream_t>(stream);
     const int chunks = (batch + 255) / 256;
     if ((training && dx) || dw || db) {
@@ -549,10 +558,33 @@ extern "C" int rl_flash_bn_backward(const float* x, const float* dy, const float
     }
     if (dx) {
         const dim3 grid((channels + 31) / 32, (batch + flash_native::ApplyRows - 1) / flash_native::ApplyRows);
-        flash_native::bn_backward_apply<<<grid, 256, 0, st>>>(x, dy, y, w, mean, var, sums, dx,
-                                                            batch, channels, eps, training != 0, relu != 0);
+        if (half_dx) {
+            flash_native::bn_backward_apply<true><<<grid, 256, 0, st>>>(x, dy, y, w, mean, var, sums, dx,
+                half_dx, batch, channels, eps, training != 0, relu != 0);
+        } else {
+            flash_native::bn_backward_apply<false><<<grid, 256, 0, st>>>(x, dy, y, w, mean, var, sums, dx,
+                nullptr, batch, channels, eps, training != 0, relu != 0);
+        }
     }
     return flash_native::launched("Run FlashSAC BatchNorm backward");
+}
+
+extern "C" int rl_flash_bn_backward(const float* x, const float* dy, const float* y, const float* w,
+                                     const float* mean, const float* var, float* partial, float* sums,
+                                     float* dx, float* dw, float* db, int batch, int channels, float eps,
+                                     int training, int relu, void* stream) noexcept {
+    return flash_bn_backward(x, dy, y, w, mean, var, partial, sums, dx, dw, db, nullptr,
+                             batch, channels, eps, training, relu, stream);
+}
+
+extern "C" int rl_flash_bn_backward_with_fp16(const float* x, const float* dy, const float* y, const float* w,
+                                               const float* mean, const float* var, float* partial, float* sums,
+                                               float* dx, float* dw, float* db, __half* half_dx,
+                                               int batch, int channels, float eps,
+                                               int training, int relu, void* stream) noexcept {
+    if (!half_dx) { set_error("FP16 BN input adjoint must be nonnull."); return -1; }
+    return flash_bn_backward(x, dy, y, w, mean, var, partial, sums, dx, dw, db, half_dx,
+                             batch, channels, eps, training, relu, stream);
 }
 
 extern "C" int rl_flash_rms_forward(const float* x, const float* w, float* var, float* y,

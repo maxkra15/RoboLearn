@@ -234,6 +234,34 @@ class _ResidualBlock(nn.Module):
         super().__post_init__()
 
     def __call__(self, input: wp.array) -> wp.array:
+        if self.fused:
+            from robolearn.cuda import CudaBatchNorm, CudaLinear
+
+            first, second = self.w1.w, self.w2.w
+            if (
+                isinstance(first, CudaLinear)
+                and isinstance(second, CudaLinear)
+                and isinstance(self.norm1, CudaBatchNorm)
+                and isinstance(self.norm2, CudaBatchNorm)
+                and first.compute_dtype == second.compute_dtype == "float16"
+            ):
+                batch = input.shape[0]
+                taped = wp._src.context.runtime.tape is not None
+                # Each raw dense output has exactly one consumer: its BN.
+                # BN is therefore the final adjoint writer before that dense
+                # callback, including input-only frozen-critic backwards.
+                first_gradient = (
+                    first.output_gradient_fp16_buffer(batch) if taped and self.norm1.requires_grad else None
+                )
+                second_gradient = (
+                    second.output_gradient_fp16_buffer(batch) if taped and self.norm2.requires_grad else None
+                )
+                second_input = second.input_fp16_buffer(batch)
+                output = first(input, output_gradient_fp16=first_gradient)
+                output = self.norm1(output, output_fp16=second_input, input_gradient_fp16=first_gradient)
+                output = second(output, input_fp16=second_input, output_gradient_fp16=second_gradient)
+                output = self.norm2(output, input_gradient_fp16=second_gradient)
+                return self.add(output, input)
         output = self.w1(input)
         if self.fused:
             output = _normalized_linear(self.norm1, self.w2, output, True)

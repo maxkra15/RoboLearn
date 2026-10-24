@@ -256,8 +256,24 @@ class CudaLinear(nn.Linear):
         self.prepare(batch_size, "float16")
         return self._cuda_plans[(batch_size, "float16")][3][1]
 
+    def output_gradient_fp16_buffer(self, batch_size: int) -> wp.array:
+        """Return the existing backward conversion buffer for an explicit final writer.
+
+        A sole consumer may round the final accumulated FP32 output adjoint
+        here before this layer's backward, then declare this same object as
+        ``output_gradient_fp16``. Keep both modules alive through graph replay.
+        Ordinary calls keep their own cast and support arbitrary consumers.
+        """
+        self.prepare(batch_size, "float16")
+        return self._cuda_plans[(batch_size, "float16")][3][2]
+
     def __call__(
-        self, input: wp.array, *, compute_dtype: str | None = None, input_fp16: wp.array | None = None
+        self,
+        input: wp.array,
+        *,
+        compute_dtype: str | None = None,
+        input_fp16: wp.array | None = None,
+        output_gradient_fp16: wp.array | None = None,
     ) -> wp.array:
         if input.dtype != wp.float32 or input.ndim != 2 or input.shape[1] != self.in_features:
             raise ValueError("CudaLinear requires float32 input shaped (batch, in_features)")
@@ -275,6 +291,10 @@ class CudaLinear(nn.Linear):
         weight = self.weight.data
         bias = self.bias.data if self.bias is not None else None
         tape = wp._src.context.runtime.tape
+        if output_gradient_fp16 is not None and (
+            converted is None or output_gradient_fp16 is not converted[2] or tape is None or output.grad is None
+        ):
+            raise ValueError("output_gradient_fp16 must be this taped layer's prepared FP16 adjoint buffer")
         if tape is not None and wp.config.verify_autograd_array_access:
             input.mark_read()
             weight.mark_read()
@@ -331,7 +351,8 @@ class CudaLinear(nn.Linear):
                     # This cache owns the forward's converted inputs until the
                     # backward has completed; the caller must honor the usual
                     # single-live-call-per-shape Warp-NN cache contract.
-                    cast(output.grad, gradient_output)
+                    if output_gradient_fp16 is None:
+                        cast(output.grad, gradient_output)
                 if input.grad is not None:
                     run(input_gradient, gradient_weight, gradient_output, input.grad, 1.0)
                 if weight.grad is not None:

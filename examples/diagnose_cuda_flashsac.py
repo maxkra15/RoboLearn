@@ -661,6 +661,227 @@ def normalization_fp16_input(report, rng):
         report.arrays(f"alias/{name}/unchanged", value, before[name], exact=True)
 
 
+def normalization_fp16_gradient(report, rng):
+    """Compare exact final-adjoint rounding with the ordinary dense backward cast."""
+    from robolearn.cuda import CudaBatchNorm, CudaLinear
+
+    batch, incoming, channels = 17, 19, 23
+    x = rng.normal(0, 0.3, (batch, incoming)).astype(np.float32)
+    w = rng.normal(0, 0.2, (channels, incoming)).astype(np.float32)
+    b = rng.normal(0, 0.1, (channels, 1)).astype(np.float32)
+    initial_raw = rng.normal(0, 0.003, (batch, channels)).astype(np.float32)
+    initial_adjoint = wp.array(initial_raw)
+    seed = rng.normal(0, 0.001, (batch, channels)).astype(np.float32)
+    for relu in (False, True):
+        for training in (False, True):
+            label = f"relu{int(relu)}-training{int(training)}"
+            norms = [CudaBatchNorm(channels, relu=relu, eps=1e-5, momentum=0.01) for _ in range(2)]
+            layers = [CudaLinear(incoming, channels, compute_dtype="float16") for _ in range(2)]
+            sources = [wp.array(x, requires_grad=True) for _ in range(2)]
+            for norm, layer in zip(norms, layers, strict=True):
+                norm.train(training)
+                layer.weight.data.assign(w)
+                layer.bias.data.assign(b)
+                layer.prepare(batch)
+            initial = [snapshot(norm.state_dict()) for norm in norms]
+            shadow = layers[1].output_gradient_fp16_buffer(batch)
+            choices = json.dumps(layers[1].tuning_metadata, sort_keys=True)
+            shadow_pointer = shadow.ptr
+            cotangent = wp.empty((batch, channels), dtype=wp.float32)
+
+            def run(index, fused, repetitions):
+                norm, layer, source = norms[index], layers[index], sources[index]
+                source.grad.zero_()
+                for module in (norm, layer):
+                    for parameter in module.parameters():
+                        if parameter.grad is not None:
+                            parameter.grad.zero_()
+                with wp.Tape() as tape:
+                    raw = layer(source, output_gradient_fp16=shadow if fused else None)
+                    output = norm(raw, input_gradient_fp16=shadow if fused else None)
+                wp.copy(raw.grad, initial_adjoint)
+                output.grad.zero_()
+                for _ in range(repetitions):
+                    tape.backward(grads={output: cotangent})
+                return raw, output
+
+            def state(index, outputs):
+                raw, output = outputs
+                result = {
+                    "raw": raw.numpy().copy(),
+                    "output": output.numpy().copy(),
+                    "raw_gradient": raw.grad.numpy().copy(),
+                    "dx": sources[index].grad.numpy().copy(),
+                }
+                for name, module in (("norm", norms[index]), ("linear", layers[index])):
+                    result.update({f"{name}.{key}": value for key, value in snapshot(module.state_dict()).items()})
+                    result.update(
+                        {
+                            f"{name}.gradient.{i}": parameter.grad.numpy().copy()
+                            for i, parameter in enumerate(module.parameters())
+                            if parameter.grad is not None
+                        }
+                    )
+                return result
+
+            fixture = {}
+            for scale in (1.0, 65536.0):
+                cotangent.assign(seed * scale)
+                for repetitions in (1, 2):
+                    case = f"{label}/scale{int(scale)}/backwards{repetitions}"
+                    for norm, saved in zip(norms, initial, strict=True):
+                        restore(norm.state_dict(), saved)
+                    reference = state(0, run(0, False, repetitions))
+                    shadow.fill_(-123.0)
+                    eager = state(1, run(1, True, repetitions))
+                    for name in reference:
+                        report.arrays(f"{case}/eager/{name}", eager[name], reference[name])
+                    report.arrays(
+                        f"{case}/final_accumulated_rounding",
+                        shadow.numpy(),
+                        eager["raw_gradient"].astype(np.float16),
+                        exact=True,
+                    )
+                    restore(norms[1].state_dict(), initial[1])
+                    with wp.ScopedCapture() as capture:
+                        outputs = run(1, True, repetitions)
+                    for index in range(2):
+                        restore(norms[1].state_dict(), initial[1])
+                        shadow.fill_(-123.0)
+                        wp.capture_launch(capture.graph)
+                        captured = state(1, outputs)
+                        for name in reference:
+                            report.arrays(f"{case}/capture{index}/{name}", captured[name], reference[name])
+                        report.arrays(
+                            f"{case}/capture{index}/rounding",
+                            shadow.numpy(),
+                            captured["raw_gradient"].astype(np.float16),
+                            exact=True,
+                        )
+                    fixture.update(
+                        {f"scale{int(scale)}.backwards{repetitions}.{key}": value for key, value in eager.items()}
+                    )
+            parameters = [norm.parameters() + layer.parameters() for norm, layer in zip(norms, layers, strict=True)]
+            gradients = [[parameter.grad for parameter in group] for group in parameters]
+            try:
+                for group in parameters:
+                    for parameter in group:
+                        parameter.grad = None
+                cotangent.assign(seed)
+                for norm, saved in zip(norms, initial, strict=True):
+                    restore(norm.state_dict(), saved)
+                reference = state(0, run(0, False, 2))
+                frozen = state(1, run(1, True, 2))
+                for name in ("dx", "raw_gradient"):
+                    report.arrays(f"{label}/frozen/{name}", frozen[name], reference[name])
+                report.arrays(
+                    f"{label}/frozen/rounding", shadow.numpy(), frozen["raw_gradient"].astype(np.float16), exact=True
+                )
+                restore(norms[1].state_dict(), initial[1])
+                with wp.ScopedCapture() as capture:
+                    outputs = run(1, True, 2)
+                for index in range(2):
+                    restore(norms[1].state_dict(), initial[1])
+                    shadow.fill_(-123.0)
+                    wp.capture_launch(capture.graph)
+                    captured = state(1, outputs)
+                    for name in ("dx", "raw_gradient"):
+                        report.arrays(f"{label}/frozen/capture{index}/{name}", captured[name], reference[name])
+                    report.arrays(
+                        f"{label}/frozen/capture{index}/rounding",
+                        shadow.numpy(),
+                        captured["raw_gradient"].astype(np.float16),
+                        exact=True,
+                    )
+            finally:
+                for group, saved in zip(parameters, gradients, strict=True):
+                    for parameter, gradient in zip(group, saved, strict=True):
+                        parameter.grad = gradient
+            report.check(
+                f"{label}/owned_pointer_and_plans_retained",
+                shadow.ptr == layers[1].output_gradient_fp16_buffer(batch).ptr == shadow_pointer
+                and json.dumps(layers[1].tuning_metadata, sort_keys=True) == choices,
+            )
+            foreign = wp.empty_like(shadow)
+            try:
+                with wp.Tape():
+                    layers[1](sources[1], output_gradient_fp16=foreign)
+            except ValueError:
+                report.check(f"{label}/foreign_shadow_rejected", True)
+            else:
+                report.check(f"{label}/foreign_shadow_rejected", False)
+            try:
+                layers[1](sources[1], output_gradient_fp16=shadow)
+            except ValueError:
+                report.check(f"{label}/untaped_declaration_rejected", True)
+            else:
+                report.check(f"{label}/untaped_declaration_rejected", False)
+            np.savez(
+                report.artifacts / f"normalization-fp16-gradient-{label}.npz",
+                **fixture,
+                source=x,
+                seed=seed,
+                initial_raw_gradient=initial_raw,
+            )
+    # Existing full-learner stages save/load all native state and replay the
+    # original captured graph; their residuals now use both backward producers.
+    report.current["checkpoint_scope"] = "Native full-learner stages exercise in-place load and captured continuation"
+    # Shape (2,C) FP16 occupies C*4 bytes, fitting even each C-element
+    # parameter/statistic array. Include adjoint aliases before any launch.
+    alias_input = wp.array(np.ones((2, channels), np.float32), requires_grad=True)
+    alias_norm = CudaBatchNorm(channels)
+    alias_norm(alias_input)
+    output, mean, variance, partial, sums = alias_norm._cache[alias_input.shape]
+    sums.zero_()
+    active = {
+        "input": alias_input,
+        "output": output,
+        "mean": mean,
+        "variance": variance,
+        "partial": partial,
+        "sums": sums,
+        **alias_norm.state_dict(),
+    }
+    for name, array in tuple(active.items()):
+        if array.grad is not None:
+            array.grad.zero_()
+            active[f"{name}.grad"] = array.grad
+    before = snapshot(active)
+    for name, array in active.items():
+        alias = wp.array(ptr=array.ptr, dtype=wp.float16, shape=alias_input.shape, device=array.device)
+        try:
+            with wp.Tape():
+                alias_norm(alias_input, input_gradient_fp16=alias)
+        except ValueError as error:
+            report.check(f"alias/{name}/rejected", "overlap" in str(error))
+        else:
+            report.check(f"alias/{name}/rejected", False)
+    shared_half = wp.empty(alias_input.shape, dtype=wp.float16)
+    try:
+        with wp.Tape():
+            alias_norm(alias_input, output_fp16=shared_half, input_gradient_fp16=shared_half)
+    except ValueError as error:
+        report.check("alias/half_buffers_rejected", "overlap" in str(error))
+    else:
+        report.check("alias/half_buffers_rejected", False)
+    for name, module, taped in (
+        ("untaped", alias_norm, False),
+        ("no_output_adjoint", CudaBatchNorm(channels, requires_grad=False), True),
+    ):
+        try:
+            if taped:
+                with wp.Tape():
+                    module(alias_input, input_gradient_fp16=shared_half)
+            else:
+                module(alias_input, input_gradient_fp16=shared_half)
+        except ValueError:
+            report.check(f"declaration/{name}/rejected", True)
+        else:
+            report.check(f"declaration/{name}/rejected", False)
+    for name, value in snapshot(active).items():
+        report.arrays(f"alias/{name}/unchanged", value, before[name], exact=True)
+
+
 def categorical(report, rng, bins=101):
     from robolearn.cuda.categorical import CudaCategorical, categorical_target
     from robolearn.warp.flashsac import _categorical_target
@@ -1022,6 +1243,7 @@ def main():
                 ("projection-ema", projection_ema),
                 ("normalization", normalization),
                 ("normalization-fp16-input", normalization_fp16_input),
+                ("normalization-fp16-gradient", normalization_fp16_gradient),
                 ("categorical", categorical),
                 ("categorical-wide", lambda report, rng: categorical(report, rng, bins=257)),
             ):
