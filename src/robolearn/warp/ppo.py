@@ -317,8 +317,13 @@ def _mlp(
     rng: np.random.Generator,
     optimized_linear_backward: bool = False,
     activation: str = "tanh",
+    dense_backend: str = "warp",
 ) -> nn.Sequential:
-    if optimized_linear_backward:
+    if dense_backend == "cuda":
+        from robolearn.cuda import CudaLinear
+
+        linear = CudaLinear
+    elif optimized_linear_backward:
         from ._linear import TiledLinear
 
         linear = TiledLinear
@@ -330,7 +335,7 @@ def _mlp(
         layer = linear(in_dim, out_dim, initialize_parameters=False)
         # Simulation callers may disable Warp differentiation globally. Enable
         # it only for the Warp-NN kernels used by this network.
-        if not layer._kernel.module.options["enable_backward"]:
+        if dense_backend == "warp" and not layer._kernel.module.options["enable_backward"]:
             wp.set_module_options({"enable_backward": True}, module=layer._kernel.module)
         bound = 1.0 / math.sqrt(in_dim)
         for parameter in (layer.weight.data, layer.bias.data):
@@ -365,6 +370,8 @@ class WarpPPO:
         device: str = "cuda",
     ):
         self.config = config or PPOConfig()
+        if self.config.dense_backend not in ("warp", "cuda"):
+            raise ValueError("dense_backend must be 'warp' or 'cuda'.")
         if min(observation_dim, action_dim, num_envs, horizon, self.config.epochs, *self.config.hidden_dims) < 1:
             raise ValueError("Dimensions, horizon, and epochs must be positive.")
         if self.config.initial_std <= 0:
@@ -395,6 +402,7 @@ class WarpPPO:
                 rng,
                 self.config.optimized_linear_backward,
                 self.config.activation,
+                self.config.dense_backend,
             )
             self.critic = _mlp(
                 observation_dim,
@@ -403,6 +411,7 @@ class WarpPPO:
                 rng,
                 self.config.optimized_linear_backward,
                 self.config.activation,
+                self.config.dense_backend,
             )
             std_initial = self.config.initial_std
             if self.config.std_type == "log":
@@ -413,7 +422,13 @@ class WarpPPO:
             else:
                 self.std_param = self.distribution_parameter
             self.parameters = self.actor.parameters() + self.critic.parameters() + [self.distribution_parameter]
-            self.optimizer = optimizers.Adam(
+            if self.config.dense_backend == "cuda":
+                from robolearn.cuda import CudaAdam
+
+                adam = CudaAdam
+            else:
+                adam = optimizers.Adam
+            self.optimizer = adam(
                 self.parameters,
                 lr=self.config.learning_rate,
                 max_norm=None if self.config.separate_grad_clipping else self.config.max_grad_norm,

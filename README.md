@@ -6,7 +6,7 @@ Small reinforcement learning implementations for GPU robot simulation.
 | --- | --- | --- |
 | `robolearn.flashsac.FlashSAC` | Authors' Torch implementation, including compilation and AMP | Recommended FlashSAC backend |
 | `robolearn.warp.WarpPPO` | Fixed buffers and capturable Warp-NN PPO updates | Single-GPU state observations |
-| `robolearn.warp.WarpFlashSAC` | FP32 Warp-NN port | Experimental; slower in current learner benchmarks |
+| `robolearn.warp.WarpFlashSAC` | Warp-NN FP32; optional native CUDA FP32 or mixed precision | Experimental; measure the selected recipe and task |
 
 Isaac Lab owns simulation, rollout collection, and experiment logging. RoboLearn
 owns policy inference, learning, and native learner checkpoints. The package
@@ -54,9 +54,12 @@ checkpointing. See [the Isaac Lab guide](docs/isaaclab.md) and
 
 The experimental `robolearn.warp.WarpFlashSAC` backend uses the same configuration,
 authors' residual networks, categorical critics, and update order. It accepts Warp
-arrays and captures replay sampling and learning updates. Start with FP32 to check
-numerical fidelity; mixed precision is not implemented. See the
-[Warp FlashSAC guide](docs/warp_flashsac.md) for scope and validation status.
+arrays and captures replay sampling and learning updates. The default Warp-NN
+backend uses FP32. The optional native CUDA backend supports FP16 dense operands
+with FP32 activations, master weights and optimizer state, plus kernel fusions.
+See the [Warp FlashSAC guide](docs/warp_flashsac.md) and
+[CUDA guide](docs/cuda.md) for scope and validation status. Torch remains the
+recommended FlashSAC backend pending native policy-learning validation.
 Construction emits a `RuntimeWarning` identifying the experimental backend;
 existing imports and checkpoint formats remain available.
 
@@ -105,6 +108,23 @@ physics requires a differentiable simulator and an additional learning objective
 The current G1 MuJoCo Warp setup does not provide that path. See
 [differentiable learning](docs/differentiable.md) for the separate experimental
 Cartpole prototype, solver limitations, and a minimal route to a hybrid learner.
+
+## Experimental native CUDA learning kernels
+
+The optional [CUDA backend](docs/cuda.md) replaces dense forward/backward and
+Adam in both Warp learners, preserving their current networks and losses. It
+uses cuBLASLt matrix products plus original CUDA bias-gradient and multi-tensor
+Adam kernels, persistent Warp-owned arrays, and CUDA graph capture. It does not
+depend on Torch. CUDA development tools are required when first building it.
+This is experimental; inspect the numerical and timing results before adopting it.
+The [upstream learner comparison](docs/cuda.md#comparison-with-upstream-learners-23-october-2026)
+measures actual RSL-RL PPO and official FlashSAC alongside RoboLearn's backends.
+
+The [25 October report](https://maxkra15.github.io/reports/2026-10-25-flashsac-consistency/)
+compares fresh-gradient native FP16 dense / FP32 state with official compiled
+Torch AMP on two L40 allocations. It retains earlier missed targets and measures
+complete learner updates, including scalar metrics; it does not measure physics
+or policy quality.
 
 ## Credits
 

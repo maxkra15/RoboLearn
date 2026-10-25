@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Holiday Robotics
 # SPDX-FileCopyrightText: Copyright (c) 2026 RoboLearn contributors
 # SPDX-License-Identifier: MIT
-"""Experimental FP32 FlashSAC updates in Warp-NN.
+"""Experimental FlashSAC updates in Warp-NN with optional native CUDA operations.
 
 Adapted from Holiday-Robot/FlashSAC, revision
 87edc9061150ae9e962dd84e6544e27a1554b3ab, accompanying
 https://arxiv.org/abs/2604.04539. The actor, temperature, distributional critic
 and target update order follows the authors' implementation. Warp-NN supplies
-the neural layers and Adam. FP16 AMP is not implemented by this backend.
+the neural storage. The native backend additionally supports FP16 dense compute,
+FP32 master weights and Adam, dynamic loss scaling, and fused normalization.
 
 Returned actions, sampled batches and device metrics use persistent storage.
 Consume or copy them before the next call that reuses the same output. Random
@@ -18,8 +19,10 @@ import json
 import math
 import warnings
 from collections.abc import Mapping
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import warp as wp
@@ -238,7 +241,7 @@ def _ema(source: wp.array(dtype=wp.float32), target: wp.array(dtype=wp.float32),
 
 @wp.kernel(enable_backward=False)
 def _schedule(
-    timestep: wp.array(dtype=wp.float32),
+    timestep: wp.array(dtype=Any),
     initial: float,
     peak: float,
     end: float,
@@ -246,7 +249,7 @@ def _schedule(
     decay_steps: int,
     learning_rate: wp.array(dtype=wp.float32),
 ):
-    step = timestep[0]
+    step = float(timestep[0])
     value = end
     if step < float(warmup_steps):
         value = initial + (peak - initial) * step / float(warmup_steps)
@@ -326,6 +329,12 @@ class WarpFlashSAC:
     CUDA capture covers replay sampling and learning, not the caller's simulator
     or Torch MDP. ``launch_update`` can be included in an external graph once
     prepared; the caller then owns host readiness and phase bookkeeping.
+
+    ``fresh_training_gradients`` opts into assigning private residual raw
+    adjoints before consuming them, on native AMP fused optimizer phases only.
+    Other adjoints retain full clearing. Ordinary taped forwards initialize
+    managed raw caches; repeated backward on one forward still accumulates.
+    Prepared graph buffers must retain their original storage.
     """
 
     def __init__(
@@ -337,10 +346,18 @@ class WarpFlashSAC:
         critic_observation_dim: int | None = None,
         *,
         optimized_linear_backward: bool = True,
+        dense_backend: str = "warp",
+        fused_updates: bool = False,
+        cuda_autotune: bool = False,
+        fresh_training_gradients: bool = False,
     ):
+        if dense_backend not in ("warp", "cuda"):
+            raise ValueError("dense_backend must be 'warp' or 'cuda'.")
         cfg = cfg or FlashSACConfig()
-        if cfg.use_amp:
-            raise ValueError("WarpFlashSAC currently implements FP32 only; set use_amp=False.")
+        if (cfg.use_amp or fused_updates or cuda_autotune) and dense_backend != "cuda":
+            raise ValueError("Mixed precision, fused updates and CUDA plan tuning require dense_backend='cuda'.")
+        if fresh_training_gradients and (dense_backend != "cuda" or not cfg.use_amp or not fused_updates):
+            raise ValueError("Fresh training gradients require native CUDA, AMP and fused_updates=True.")
         if min(observation_dim, action_dim, num_envs) < 1:
             raise ValueError("Observation, action and environment dimensions must be positive.")
         total_dim = critic_observation_dim or observation_dim
@@ -358,7 +375,7 @@ class WarpFlashSAC:
         )
         self.device = wp.get_device(cfg.device)
         warnings.warn(
-            "WarpFlashSAC is an experimental FP32 backend; policy quality and speed must be measured for your task.",
+            "WarpFlashSAC is experimental; policy quality and speed must be measured for your task.",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -368,10 +385,24 @@ class WarpFlashSAC:
         self.num_envs = num_envs
         self.batch_size = cfg.sample_batch_size
         self.optimized_linear_backward = optimized_linear_backward
+        self.dense_backend = dense_backend
+        self.fused_updates = fused_updates
+        self.cuda_autotune = bool(cuda_autotune)
+        self.fresh_training_gradients = bool(fresh_training_gradients)
+        self.compute_dtype = "float16" if cfg.use_amp else "float32"
         self._update_step = 0
         self._prepared = False
         self._update_graphs = {}
+        self._captured_fresh_policy = ()
         self._retained_tapes = []
+        self._zero_plans = {}
+        self._zero_plan_disabled = set()
+        self._zero_plan_status = {}
+        self._fresh_phases = {}
+        if self.fresh_training_gradients:
+            from ._fresh_gradients import FreshPhase
+
+            self._fresh_phases = {phase: FreshPhase(self.device) for phase in ("actor", "critic")}
         with wp.ScopedDevice(self.device):
             self.actor = FlashActor(
                 observation_dim,
@@ -381,6 +412,10 @@ class WarpFlashSAC:
                 seed=cfg.seed,
                 device=self.device,
                 optimized_linear_backward=optimized_linear_backward,
+                dense_backend=dense_backend,
+                compute_dtype=self.compute_dtype,
+                fused_updates=fused_updates,
+                cuda_autotune=self.cuda_autotune,
             )
             critic_args = (
                 total_dim,
@@ -396,18 +431,26 @@ class WarpFlashSAC:
                 seed=cfg.seed + 1,
                 device=self.device,
                 optimized_linear_backward=optimized_linear_backward,
+                dense_backend=dense_backend,
+                compute_dtype=self.compute_dtype,
+                fused_updates=fused_updates,
+                cuda_autotune=self.cuda_autotune,
             )
             self.target_critic = FlashDoubleCritic(
                 *critic_args,
                 seed=cfg.seed + 1,
                 device=self.device,
                 optimized_linear_backward=optimized_linear_backward,
+                dense_backend=dense_backend,
+                compute_dtype=self.compute_dtype,
+                fused_updates=fused_updates,
+                cuda_autotune=self.cuda_autotune,
                 requires_grad=False,
             )
             self.target_critic.load_state_dict(self.critic.state_dict())
             self.log_temperature = wp.array([math.log(cfg.temp_initial_value)], dtype=wp.float32, requires_grad=True)
-            self.actor_optimizer = self._optimizer(self.actor.parameters())
-            self.critic_optimizer = self._optimizer(self.critic.parameters())
+            self.actor_optimizer = self._optimizer(self.actor.parameters(), scaled=cfg.use_amp)
+            self.critic_optimizer = self._optimizer(self.critic.parameters(), scaled=cfg.use_amp)
             self.temperature_optimizer = self._optimizer([self.log_temperature])
             self.update_counters = wp.zeros(3, dtype=wp.int64)
             self._replay_buffer = WarpFlashReplay(total_dim, action_dim, num_envs, self.cfg, self.device)
@@ -462,6 +505,22 @@ class WarpFlashSAC:
         if set(source) != set(target):
             raise ValueError("Online and target critic parameter names differ.")
         self._ema_parameters = [(source[name].data.flatten(), target[name].data.flatten()) for name in source]
+        self._fused_ema = None
+        if fused_updates:
+            from robolearn.cuda import CudaLinear
+            from robolearn.cuda.flash import CudaEMA
+
+            target_shadows = {
+                module.weight.data.ptr: module.weight_shadow.flatten()
+                for module in self.target_critic._all_modules()
+                if isinstance(module, CudaLinear) and module.weight_shadow is not None
+            }
+            self._fused_ema = CudaEMA(
+                sources=[pair[0] for pair in self._ema_parameters],
+                targets=[pair[1] for pair in self._ema_parameters],
+                target_shadows=[target_shadows.get(pair[1].ptr) for pair in self._ema_parameters],
+                tau=cfg.critic_target_update_tau,
+            ).prepare()
         self.metrics = {
             "actor/loss": self.actor_loss,
             "actor/entropy": self.entropy,
@@ -472,14 +531,23 @@ class WarpFlashSAC:
             "temperature/value": self.temperature_value,
         }
 
-    def _optimizer(self, parameters):
-        return optimizers.Adam(
+    def _optimizer(self, parameters, *, scaled=False):
+        if self.dense_backend == "cuda":
+            from robolearn.cuda import CudaAdam
+
+            adam = CudaAdam
+            options = {"dynamic_loss_scale": scaled}
+        else:
+            adam = optimizers.Adam
+            options = {}
+        return adam(
             parameters,
             lr=self.cfg.learning_rate_init,
             device=self.device,
             disable_graph=True,
             betas=(0.9, 0.999),
             eps=1.0e-8,
+            **options,
         )
 
     def parameters(self) -> list[wp.array]:
@@ -502,7 +570,11 @@ class WarpFlashSAC:
         wp.launch(
             _actor_prefix, dim=actor_observations.shape, inputs=[observations, actor_observations], device=self.device
         )
-        mean, log_std = self.actor(actor_observations, training=False)
+        if self.cfg.use_amp:
+            with self.actor.precision("float32"):
+                mean, log_std = self.actor(actor_observations, training=False)
+        else:
+            mean, log_std = self.actor(actor_observations, training=False)
         if training:
             wp.launch(
                 _exploration_repeat,
@@ -554,11 +626,12 @@ class WarpFlashSAC:
 
     def _schedule_optimizer(self, optimizer) -> None:
         cfg = self.cfg
+        timestep = optimizer.attempted_steps if getattr(optimizer, "dynamic_loss_scale", False) else optimizer._timestep
         wp.launch(
             _schedule,
             dim=1,
             inputs=[
-                optimizer._timestep,
+                timestep,
                 cfg.learning_rate_init,
                 cfg.learning_rate_peak,
                 cfg.learning_rate_end,
@@ -572,8 +645,90 @@ class WarpFlashSAC:
     def _step(self, optimizer) -> None:
         self._schedule_optimizer(optimizer)
         optimizer.step()
-        # Saved LR has the same post-step scheduler position as Torch LambdaLR.
+        # Scheduler follows attempted updates, including skipped FP16 steps.
         self._schedule_optimizer(optimizer)
+
+    def _backward(self, tape, loss, optimizer, *, scaled=True) -> None:
+        if scaled and getattr(optimizer, "dynamic_loss_scale", False):
+            # Tape copies this seed into the loss's independent gradient array.
+            # Loss scale state must never be aliased to a gradient cleared by zero().
+            if loss.grad is None or loss.grad.ptr == optimizer.loss_scale.ptr:
+                raise RuntimeError("Scaled loss requires an independent persistent gradient array.")
+            tape.backward(grads={loss: optimizer.loss_scale})
+        else:
+            tape.backward(loss)
+
+    @contextmanager
+    def _fresh_scope(self, phase, apply_optimizer, *networks):
+        if not self.fresh_training_gradients or not apply_optimizer:
+            yield None
+            return
+        control = self._fresh_phases[phase].begin()
+        with ExitStack() as stack:
+            for network in networks:
+                stack.enter_context(network._fresh_gradient_scope(control))
+            yield control
+
+    def fresh_gradient_metadata(self) -> dict:
+        """Return host-only activation/fallback and clear-byte records."""
+        return {
+            phase: {
+                "enabled": state.plan is not None and state.disabled_reason is None,
+                "fallback_reason": state.disabled_reason,
+                "owned_raw_arrays": len(state.owners),
+                "owned_raw_bytes": sum(span[1] for *_, span in state.owners),
+                "remaining_clear_bytes": state.plan.total_bytes if state.plan is not None else None,
+            }
+            for phase, state in self._fresh_phases.items()
+        }
+
+    def _zero_tape(self, tape, phase: str, control=None) -> None:
+        """Clear a complete phase's adjoints with bounded, verified metadata.
+
+        Network buffers are shape caches and checkpoint loads copy in place.
+        Nevertheless every host launch checks the actual tape inventory. A
+        changed/unsupported inventory permanently uses Warp's original clear
+        for that phase; old metadata stays alive for any existing CUDA graph.
+        """
+        if control is not None and control.enabled:
+            self._zero_plans[phase] = control.phase.plan
+            self._zero_plan_status[phase] = control.clear(tape)
+            return
+        if not self.fused_updates:
+            tape.zero()
+            return
+        if phase not in ("actor", "critic", "temperature"):
+            raise ValueError("Unknown gradient-clear phase")
+        from robolearn.cuda.zero import CudaZero
+
+        gradients = tuple(tape.gradients.values())
+        if phase in self._zero_plan_disabled:
+            tape.zero()
+            return
+        reason = None
+        if not gradients or not CudaZero.supports(gradients, self.device) or not any(g.size for g in gradients):
+            reason = "unsupported_gradient_inventory"
+        plan = self._zero_plans.get(phase)
+        if reason is None and plan is None:
+            if self.device.is_capturing:
+                reason = "gradient_inventory_not_prepared_before_capture"
+            else:
+                plan = CudaZero(gradients).prepare()
+                self._zero_plans[phase] = plan
+        elif reason is None and not plan.matches(gradients):
+            reason = "gradient_pointer_signature_changed"
+        if reason is not None:
+            self._zero_plan_disabled.add(phase)
+            self._zero_plan_status[phase] = {"mode": "warp", "reason": reason}
+            tape.zero()
+            return
+        plan.step(gradients)
+        self._zero_plan_status[phase] = {
+            "mode": "native",
+            "arrays": plan.array_count,
+            "ranges": plan.range_count,
+            "bytes": plan.total_bytes,
+        }
 
     def _update_actor(self, apply_optimizer: bool) -> None:
         self.actor_loss.zero_()
@@ -581,7 +736,10 @@ class WarpFlashSAC:
         self.mean_action.zero_()
         self._q_abs.zero_()
         wp.launch(_temperature_value, dim=1, inputs=[self.log_temperature, self.alpha], device=self.device)
-        with self.critic.freeze_parameters():
+        with (
+            self.critic.freeze_parameters(),
+            self._fresh_scope("actor", apply_optimizer, self.actor, self.critic) as control,
+        ):
             with wp.Tape() as tape:
                 mean, log_std = self.actor(self._actor_observations, training=True)
                 wp.launch(
@@ -621,11 +779,15 @@ class WarpFlashSAC:
                     outputs=[self.actor_loss],
                     device=self.device,
                 )
-            tape.backward(self.actor_loss)
+            if control is not None:
+                control.select(tape)
+            self._backward(tape, self.actor_loss, self.actor_optimizer, scaled=apply_optimizer)
             if apply_optimizer:
+                if control is not None:
+                    control.finish(tape)
                 self._step(self.actor_optimizer)
                 self.actor.normalize_parameters()
-                tape.zero()
+                self._zero_tape(tape, "actor", control)
             else:
                 self._retained_tapes.append(tape)
 
@@ -643,7 +805,7 @@ class WarpFlashSAC:
         tape.backward(self.temperature_loss)
         if apply_optimizer:
             self._step(self.temperature_optimizer)
-            tape.zero()
+            self._zero_tape(tape, "temperature")
         else:
             self._retained_tapes.append(tape)
 
@@ -673,41 +835,47 @@ class WarpFlashSAC:
         )
         target_q, target_lp = self.target_critic(self._critic_observations, self._critic_actions, training=True)
         self.maximum_entropy_bonus.fill_(-1.0e30)
-        wp.launch(
-            _categorical_target,
-            dim=self.batch_size,
-            inputs=[
-                target_q,
-                target_lp,
-                reward,
-                self.batch["terminated"],
-                self.batch["discount"],
-                self._next_log_probs,
-                self.alpha,
-                self.cfg.critic_min_v,
-                self.cfg.critic_max_v,
-                self.target_probabilities,
-                self.maximum_entropy_bonus,
-            ],
-            device=self.device,
-        )
-        self.critic_loss.zero_()
-        with wp.Tape() as tape:
-            _, log_probs = self.critic(self._critic_observations, self._critic_actions, training=True)
-            wp.launch(
-                _critic_objective,
-                dim=(2, self.batch_size),
-                inputs=[log_probs, self.target_probabilities],
-                outputs=[self.critic_loss],
-                device=self.device,
-            )
-        tape.backward(self.critic_loss)
-        if apply_optimizer:
-            self._step(self.critic_optimizer)
-            self.critic.normalize_parameters()
-            tape.zero()
+        target_inputs = [
+            target_q,
+            target_lp,
+            reward,
+            self.batch["terminated"],
+            self.batch["discount"],
+            self._next_log_probs,
+            self.alpha,
+            self.cfg.critic_min_v,
+            self.cfg.critic_max_v,
+            self.target_probabilities,
+            self.maximum_entropy_bonus,
+        ]
+        if self.fused_updates and self.cfg.critic_num_bins <= 4096:
+            from robolearn.cuda.categorical import categorical_target
+
+            categorical_target(*target_inputs)
         else:
-            self._retained_tapes.append(tape)
+            wp.launch(_categorical_target, dim=self.batch_size, inputs=target_inputs, device=self.device)
+        self.critic_loss.zero_()
+        with self._fresh_scope("critic", apply_optimizer, self.critic) as control:
+            with wp.Tape() as tape:
+                _, log_probs = self.critic(self._critic_observations, self._critic_actions, training=True)
+                wp.launch(
+                    _critic_objective,
+                    dim=(2, self.batch_size),
+                    inputs=[log_probs, self.target_probabilities],
+                    outputs=[self.critic_loss],
+                    device=self.device,
+                )
+            if control is not None:
+                control.select(tape)
+            self._backward(tape, self.critic_loss, self.critic_optimizer, scaled=apply_optimizer)
+            if apply_optimizer:
+                if control is not None:
+                    control.finish(tape)
+                self._step(self.critic_optimizer)
+                self.critic.normalize_parameters()
+                self._zero_tape(tape, "critic", control)
+            else:
+                self._retained_tapes.append(tape)
 
     def launch_update(
         self,
@@ -724,6 +892,9 @@ class WarpFlashSAC:
         graph choice; device counters and RNG advance each replay. ``sample=False``
         uses ``batch``, ``actor_noise`` and ``next_noise`` for numerical diagnostics.
         """
+        if self.fresh_training_gradients and not apply_optimizer:
+            for phase in self._fresh_phases.values():
+                phase.clear()
         if sample:
             self.replay.sample(check_ready=False)
         reward = self.batch["reward"]
@@ -754,13 +925,16 @@ class WarpFlashSAC:
             wp.launch(_normal_noise, dim=self.batch_size, inputs=[self._next_rng, self.next_noise], device=self.device)
         self._update_critic(reward, apply_optimizer)
         if apply_optimizer:
-            for source, target in self._ema_parameters:
-                wp.launch(
-                    _ema,
-                    dim=source.size,
-                    inputs=[source, target, self.cfg.critic_target_update_tau],
-                    device=self.device,
-                )
+            if self._fused_ema is not None:
+                self._fused_ema.step()
+            else:
+                for source, target in self._ema_parameters:
+                    wp.launch(
+                        _ema,
+                        dim=source.size,
+                        inputs=[source, target, self.cfg.critic_target_update_tau],
+                        device=self.device,
+                    )
             wp.launch(_advance_updates, dim=1, inputs=[self.update_counters, int(do_actor_update)], device=self.device)
 
     def update_from_batch(
@@ -840,11 +1014,21 @@ class WarpFlashSAC:
         self.prepare(capture=False)
         if not self.device.is_cuda:
             return
+        # As with the other native plans, already captured graphs require
+        # fixed owned storage. Full owner checks happen before eager backward
+        # and during capture recording, never on each timed graph replay.
+        policy = tuple((name, phase.disabled_reason) for name, phase in self._fresh_phases.items())
+        if policy != self._captured_fresh_policy:
+            self._update_graphs.clear()
+            self._captured_fresh_policy = policy
         for phase in (True, False):
             if phase not in self._update_graphs:
                 with wp.ScopedCapture(device=self.device) as captured:
                     self.launch_update(phase)
                 self._update_graphs[phase] = captured.graph
+        if policy != tuple((name, phase.disabled_reason) for name, phase in self._fresh_phases.items()):
+            self._update_graphs.clear()
+            raise RuntimeError("Fresh-gradient policy changed during capture; prepare stable buffers before replay")
 
     def update(self, *, tensor_metrics: bool = False, capture: bool = True) -> dict:
         """Perform one replay update, choosing the actor phase from the host mirror."""
@@ -871,9 +1055,16 @@ class WarpFlashSAC:
             critic_optimizer_steps=float(self.critic_optimizer._timestep.numpy()[0]),
             temperature_optimizer_steps=float(self.temperature_optimizer._timestep.numpy()[0]),
         )
+        for name, optimizer in (("actor", self.actor_optimizer), ("critic", self.critic_optimizer)):
+            if getattr(optimizer, "dynamic_loss_scale", False):
+                result[f"{name}_amp_loss_scale"] = float(optimizer.loss_scale.numpy()[0])
+                result[f"{name}_optimizer_attempts"] = int(optimizer.attempted_steps.numpy()[0])
+                result[f"{name}_optimizer_skips"] = int(optimizer.skipped_steps.numpy()[0])
         return result
 
     def _clear_gradients(self) -> None:
+        for phase in self._fresh_phases.values():
+            phase.clear()
         for tape in self._retained_tapes:
             tape.zero()
         self._retained_tapes.clear()
@@ -904,6 +1095,8 @@ class WarpFlashSAC:
             arrays.update({f"optimizer.{name}.m2.{i}": value for i, value in enumerate(optimizer._m2)})
             arrays[f"optimizer.{name}.timestep"] = optimizer._timestep
             arrays[f"optimizer.{name}.lr"] = optimizer._lr
+            if getattr(optimizer, "dynamic_loss_scale", False):
+                arrays.update({f"optimizer.{name}.amp.{key}": value for key, value in optimizer.state_arrays().items()})
         arrays.update(
             {
                 "log_temperature": self.log_temperature,
@@ -944,6 +1137,8 @@ class WarpFlashSAC:
                 raise ValueError(f"Checkpoint array {key} is missing or has the wrong shape.")
         for key, array in arrays.items():
             self._assign(array, state[key], key)
+        for network in (self.actor, self.critic, self.target_critic):
+            network.refresh_weight_shadows()
         replay_state = {key.removeprefix("replay."): value for key, value in state.items() if key.startswith("replay.")}
         self.replay.load_state_dict(replay_state, restore_storage=bool(state["replay_storage_included"][0]))
         if self.reward_normalizer is not None:
@@ -957,19 +1152,37 @@ class WarpFlashSAC:
         self._update_step = int(np.asarray(state["update_counters"])[0])
         self._clear_gradients()
 
+    def cuda_tuning_metadata(self) -> dict:
+        """Return host-side prepared dense-plan choices without synchronizing CUDA."""
+        if self.dense_backend != "cuda":
+            return {}
+        from robolearn.cuda import CudaLinear
+
+        result = {}
+        for label, network in (("actor", self.actor), ("critic", self.critic), ("target_critic", self.target_critic)):
+            names = {id(parameter): name for name, parameter in network.named_parameters()}
+            for module in network._all_modules():
+                if isinstance(module, CudaLinear):
+                    result[f"{label}.{names[id(module.weight)]}"] = module.tuning_metadata
+        return result
+
     def save(self, path: str | Path, *, include_replay: bool = False) -> None:
         """Save a NumPy/JSON checkpoint; omitted replay is explicitly reset on load."""
         directory = Path(path)
         directory.mkdir(parents=True, exist_ok=True)
         metadata = {
             "format": "robolearn-warp-flashsac-v1",
-            "precision": "float32",
+            "precision": self.compute_dtype,
             "observation_dim": self.observation_dim,
             "action_dim": self.action_dim,
             "critic_observation_dim": self.critic_observation_dim if self.cfg.asymmetric_observation else None,
             "num_envs": self.num_envs,
             "config": asdict(self.cfg),
             "optimized_linear_backward": self.optimized_linear_backward,
+            "dense_backend": self.dense_backend,
+            "fused_updates": self.fused_updates,
+            "cuda_autotune": self.cuda_autotune,
+            "fresh_training_gradients": self.fresh_training_gradients,
             "replay_included": include_replay,
         }
         state = self.state_dict(include_replay=include_replay)
@@ -992,6 +1205,8 @@ class WarpFlashSAC:
         saved_critic_dim = metadata["critic_observation_dim"] or metadata["observation_dim"]
         if saved_critic_dim != self.critic_observation_dim:
             raise ValueError("Checkpoint critic observation dimension differs from this agent.")
+        if metadata.get("precision", "float32") != self.compute_dtype and self.cfg.load_optimizer:
+            raise ValueError("Switching checkpoint dense precision requires load_optimizer=False.")
         with np.load(directory / "agent.npz", allow_pickle=False) as archive:
             state = dict(archive)
         if metadata["replay_included"] and metadata["num_envs"] != self.num_envs:

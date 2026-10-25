@@ -2,12 +2,27 @@
 
 ## Unreleased
 
-- Load Warp learners lazily so selecting PPO does not import experimental FlashSAC.
-- Allow `PPOConfig` imports without installing Torch, Warp, or Warp-NN; preserve
-  existing public imports and configuration defaults.
-- Emit an explicit experimental-backend warning when constructing Warp FlashSAC.
-- Document Isaac Lab logging/checkpoint support, measured FlashSAC bottlenecks,
-  and the separate requirements for learning through simulator gradients.
+- Add optional experimental native CUDA FP32 dense forward/backward and fused
+  multi-tensor Adam for Warp PPO and Warp FlashSAC, preserving networks, losses,
+  optimizer arrays and the default Warp backend.
+- Add native FlashSAC FP16 dense operands with FP32 outputs and optimizer state,
+  dynamic loss scaling and checkpointed attempt/skip counters. Fuse normalization,
+  ReLU, categorical operations, parameter projections and target EMA.
+- Reuse owned FP16 conversion buffers and batch verified gradient clears. Add
+  opt-in `fresh_training_gradients` for private residual adjoints, with ownership
+  checks, activation metadata and ordinary accumulation/full-clear fallback;
+  complete clearing remains the default.
+- Add preparation-only cuBLASLt tuning with private scratch, fixed captured plans
+  and recorded choices, plus balanced FlashSAC benchmarks with matched initial
+  state and update counts.
+- Add standalone numerical, capture and checkpoint diagnostics and synthetic
+  update benchmarks; performance and learning quality require measured results.
+- Align optional Torch FlashSAC compilation with the authors' categorical and
+  reward helpers, preserving eager execution and per-transition discounts.
+- Keep learner imports lazy and `PPOConfig` independent of optional dependencies;
+  explicitly warn that Warp FlashSAC is experimental.
+- Document Isaac Lab logging/checkpoints, backend constraints and the separate
+  requirements for learning through simulator gradients.
 
 ## 0.3.0 - 2026-10-09
 

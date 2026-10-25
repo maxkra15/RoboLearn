@@ -12,6 +12,7 @@ module outputs: consume them before another call with the same batch shape.
 
 from collections.abc import Mapping
 from contextlib import contextmanager
+from functools import partial
 
 import numpy as np
 import warp as wp
@@ -19,6 +20,36 @@ from warp_nn import nn
 
 from ._flash_normalization import BatchNorm, LogSoftmax, RMSNorm
 from ._linear import TiledLinear
+
+
+def _linear_type(
+    dense_backend: str, optimized_linear_backward: bool, compute_dtype: str = "float32", cuda_autotune: bool = False
+):
+    if dense_backend == "cuda":
+        from robolearn.cuda import CudaLinear
+
+        return partial(CudaLinear, compute_dtype=compute_dtype, autotune=cuda_autotune)
+    if dense_backend != "warp":
+        raise ValueError("dense_backend must be 'warp' or 'cuda'.")
+    if cuda_autotune:
+        raise ValueError("CUDA plan tuning requires dense_backend='cuda'.")
+    return TiledLinear if optimized_linear_backward else nn.Linear
+
+
+def _batch_norm(dimension, requires_grad, fused, *, relu=False):
+    if fused:
+        from robolearn.cuda.normalization import CudaBatchNorm
+
+        return CudaBatchNorm(dimension, eps=1.0e-5, momentum=0.01, requires_grad=requires_grad, relu=relu)
+    return _UnitBatchNorm(dimension, requires_grad)
+
+
+def _rms_norm(dimension, requires_grad, fused):
+    if fused:
+        from robolearn.cuda.normalization import CudaRMSNorm
+
+        return CudaRMSNorm(dimension, eps=1.0e-6, requires_grad=requires_grad)
+    return _UnitRMSNorm(dimension, requires_grad)
 
 
 @wp.kernel(enable_backward=False)
@@ -136,9 +167,8 @@ def _orthogonal(shape: tuple[int, int], rng: np.random.Generator) -> np.ndarray:
 
 
 class _UnitLinear(nn.Module):
-    def __init__(self, input_dim, output_dim, rng, optimized_linear_backward, requires_grad):
+    def __init__(self, input_dim, output_dim, rng, linear, requires_grad):
         super().__init__(requires_grad=requires_grad)
-        linear = TiledLinear if optimized_linear_backward else nn.Linear
         self.w = linear(input_dim, output_dim, bias=False, initialize_parameters=False, requires_grad=requires_grad)
         wp.copy(self.w.weight.data, wp.array(_orthogonal((output_dim, input_dim), rng), device=self.device))
         super().__post_init__()
@@ -166,32 +196,104 @@ class _UnitRMSNorm(RMSNorm):
         wp.launch(_normalize_scale, dim=1, inputs=[self.weight.data], device=self.device)
 
 
+def _normalized_linear(norm, linear, input, fused):
+    """Share an explicit consumer-owned FP16 input buffer on the fused AMP path."""
+    if fused:
+        from robolearn.cuda import CudaBatchNorm, CudaLinear
+
+        consumer = linear.w
+        if isinstance(norm, CudaBatchNorm) and isinstance(consumer, CudaLinear) and consumer.compute_dtype == "float16":
+            shadow = consumer.input_fp16_buffer(input.shape[0])
+            return consumer(norm(input, output_fp16=shadow), input_fp16=shadow)
+    return linear(norm(input))
+
+
 class _Embedder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, rng, optimized_linear_backward, requires_grad):
+    def __init__(self, input_dim, hidden_dim, rng, linear, requires_grad, fused=False):
         super().__init__(requires_grad=requires_grad)
-        self.norm = _UnitBatchNorm(input_dim, requires_grad)
-        self.w = _UnitLinear(input_dim, hidden_dim, rng, optimized_linear_backward, requires_grad)
+        self.norm = _batch_norm(input_dim, requires_grad, fused)
+        self.w = _UnitLinear(input_dim, hidden_dim, rng, linear, requires_grad)
+        self.fused = fused
         super().__post_init__()
 
     def __call__(self, input: wp.array) -> wp.array:
-        return self.w(self.norm(input))
+        return _normalized_linear(self.norm, self.w, input, self.fused)
 
 
 class _ResidualBlock(nn.Module):
-    def __init__(self, hidden_dim, rng, optimized_linear_backward, requires_grad):
+    def __init__(self, hidden_dim, rng, linear, requires_grad, fused=False):
         super().__init__(requires_grad=requires_grad)
-        self.w1 = _UnitLinear(hidden_dim, hidden_dim * 4, rng, optimized_linear_backward, requires_grad)
-        self.w2 = _UnitLinear(hidden_dim * 4, hidden_dim, rng, optimized_linear_backward, requires_grad)
-        self.norm1 = _UnitBatchNorm(hidden_dim * 4, requires_grad)
-        self.norm2 = _UnitBatchNorm(hidden_dim, requires_grad)
+        self.w1 = _UnitLinear(hidden_dim, hidden_dim * 4, rng, linear, requires_grad)
+        self.w2 = _UnitLinear(hidden_dim * 4, hidden_dim, rng, linear, requires_grad)
+        self.norm1 = _batch_norm(hidden_dim * 4, requires_grad, fused, relu=True)
+        self.norm2 = _batch_norm(hidden_dim, requires_grad, fused, relu=True)
+        self.fused = fused
+        self._fresh_control = None
+        self._fresh_managed = False
         self.relu1 = nn.ReLU(requires_grad=requires_grad)
         self.relu2 = nn.ReLU(requires_grad=requires_grad)
         self.add = nn.Add(requires_grad=requires_grad)
         super().__post_init__()
 
     def __call__(self, input: wp.array) -> wp.array:
-        output = self.relu1(self.norm1(self.w1(input)))
-        output = self.relu2(self.norm2(self.w2(output)))
+        if self._fresh_managed and self._fresh_control is None and wp._src.context.runtime.tape is not None:
+            # External graph replays bypass host dirty flags. Ordinary taped
+            # forwards therefore initialize these managed private caches in
+            # either precision. Repeated backward on one forward still adds.
+            for layer in (self.w1.w, self.w2.w):
+                cached = layer._cache.get(((input.shape[0], layer.out_features), wp.float32))
+                owner = getattr(layer, "_fresh_raw_owners", {}).get((input.shape[0], layer.out_features))
+                if owner is not None:
+                    raw, gradient, span = owner
+                    if cached is not raw or raw.grad is not gradient or (gradient.ptr, gradient.size * 4) != span:
+                        raise RuntimeError("Restore prepared raw-adjoint ownership before ordinary taped use")
+                    gradient.zero_()
+        if self.fused:
+            from robolearn.cuda import CudaBatchNorm, CudaLinear
+
+            first, second = self.w1.w, self.w2.w
+            if (
+                isinstance(first, CudaLinear)
+                and isinstance(second, CudaLinear)
+                and isinstance(self.norm1, CudaBatchNorm)
+                and isinstance(self.norm2, CudaBatchNorm)
+                and first.compute_dtype == second.compute_dtype == "float16"
+            ):
+                batch = input.shape[0]
+                taped = wp._src.context.runtime.tape is not None
+                control = self._fresh_control
+                # Each raw dense output has exactly one consumer: its BN.
+                # BN is therefore the final adjoint writer before that dense
+                # callback, including input-only frozen-critic backwards.
+                first_gradient = (
+                    first.output_gradient_fp16_buffer(batch) if taped and self.norm1.requires_grad else None
+                )
+                second_gradient = (
+                    second.output_gradient_fp16_buffer(batch) if taped and self.norm2.requires_grad else None
+                )
+                second_input = second.input_fp16_buffer(batch)
+                output = first(input, output_gradient_fp16=first_gradient)
+                if control is not None:
+                    control.record(first, output)
+                output = self.norm1(
+                    output,
+                    output_fp16=second_input,
+                    input_gradient_fp16=first_gradient,
+                    overwrite_dx=control is not None,
+                )
+                output = second(output, input_fp16=second_input, output_gradient_fp16=second_gradient)
+                if control is not None:
+                    control.record(second, output)
+                output = self.norm2(output, input_gradient_fp16=second_gradient, overwrite_dx=control is not None)
+                return self.add(output, input)
+        output = self.w1(input)
+        if self.fused:
+            output = _normalized_linear(self.norm1, self.w2, output, True)
+        else:
+            output = self.w2(self.relu1(self.norm1(output)))
+        output = self.norm2(output)
+        if not self.fused:
+            output = self.relu2(output)
         return self.add(output, input)
 
 
@@ -211,6 +313,7 @@ def _load_author_arrays(module: nn.Module, mapping: Mapping[str, np.ndarray]) ->
         if value.shape != array.shape:
             raise ValueError(f"Checkpoint {name!r} has shape {value.shape}, expected {array.shape}.")
         wp.copy(array, wp.array(np.ascontiguousarray(value), dtype=wp.float32, device=array.device))
+    module.refresh_weight_shadows()
 
 
 class _FlashNetwork(nn.Module):
@@ -220,12 +323,95 @@ class _FlashNetwork(nn.Module):
 
     def normalize_parameters(self) -> None:
         """Apply the authors' projections after an Adam update, outside its tape."""
+        if getattr(self, "fused_updates", False):
+            from robolearn.cuda import CudaLinear
+            from robolearn.cuda.flash import CudaProjection
+            from robolearn.cuda.normalization import CudaBatchNorm, CudaRMSNorm
+
+            if not hasattr(self, "_projection"):
+                rows, shadows, affines, scales = [], [], [], []
+                for module in self._all_modules():
+                    if isinstance(module, _UnitLinear):
+                        rows.append(module.w.weight.data)
+                        shadow = None
+                        if isinstance(module.w, CudaLinear) and module.w.compute_dtype == "float16":
+                            shadow = module.w.prepare_weight_shadow()
+                            module.w.set_weight_shadow_managed(True)
+                        shadows.append(shadow)
+                    elif isinstance(module, CudaBatchNorm):
+                        affines.append((module.weight.data, module.bias.data))
+                    elif isinstance(module, CudaRMSNorm):
+                        scales.append(module.weight.data)
+                self._projection = CudaProjection(
+                    rows=rows, row_shadows=shadows, affines=affines, scales=scales
+                ).prepare()
+            self._projection.step()
+            return
         pending = list(self.modules())
         while pending:
             module = pending.pop()
             if isinstance(module, (_UnitLinear, _UnitBatchNorm, _UnitRMSNorm)):
                 module.normalize_parameters()
             pending.extend(module.modules())
+
+    def refresh_weight_shadows(self) -> None:
+        """Refresh derived native operands after direct master-array restoration."""
+        if not getattr(self, "fused_updates", False):
+            return
+        from robolearn.cuda import CudaLinear
+
+        for module in self._all_modules():
+            if isinstance(module, CudaLinear) and module.weight_shadow is not None:
+                module.refresh_weight_shadow()
+
+    def load_state_dict(self, state_dict: dict[str, wp.array]) -> None:
+        """Load owned arrays, then refresh derived FP16 operands in place."""
+        super().load_state_dict(state_dict)
+        self.refresh_weight_shadows()
+
+    def _all_modules(self):
+        pending, seen = list(self.modules()), set()
+        while pending:
+            module = pending.pop()
+            if id(module) in seen:
+                continue
+            seen.add(id(module))
+            yield module
+            pending.extend(module.modules())
+
+    @contextmanager
+    def precision(self, compute_dtype: str):
+        """Select native dense precision for a forward, retaining FP32 owned arrays."""
+        layers = [module for module in self._all_modules() if hasattr(module, "compute_dtype")]
+        previous = [layer.compute_dtype for layer in layers]
+        try:
+            for layer in layers:
+                layer.compute_dtype = compute_dtype
+            yield self
+        finally:
+            for layer, dtype in zip(layers, previous, strict=True):
+                layer.compute_dtype = dtype
+
+    @contextmanager
+    def _fresh_gradient_scope(self, control):
+        """Bind a private phase decision to callbacks recorded by this forward."""
+        from robolearn.cuda.normalization import CudaBatchNorm
+
+        modules = list(self._all_modules())
+        try:
+            for module in modules:
+                if isinstance(module, _ResidualBlock):
+                    module._fresh_managed = True
+                    module._fresh_control = control
+                elif isinstance(module, CudaBatchNorm):
+                    module._overwrite_control = control
+            yield
+        finally:
+            for module in modules:
+                if isinstance(module, _ResidualBlock):
+                    module._fresh_control = None
+                elif isinstance(module, CudaBatchNorm):
+                    module._overwrite_control = None
 
     @contextmanager
     def freeze_parameters(self):
@@ -248,18 +434,17 @@ class _FlashNetwork(nn.Module):
 
 
 class _Backbone(_FlashNetwork):
-    def __init__(self, input_dim, hidden_dim, num_blocks, rng, optimized_linear_backward, requires_grad):
+    def __init__(self, input_dim, hidden_dim, num_blocks, rng, linear, requires_grad, fused=False):
         super().__init__(requires_grad=requires_grad)
+        self.fused_updates = fused
         self.embedder = self.register_module(
-            "embedder", _Embedder(input_dim, hidden_dim, rng, optimized_linear_backward, requires_grad)
+            "embedder", _Embedder(input_dim, hidden_dim, rng, linear, requires_grad, fused)
         )
         self.encoder = tuple(
-            self.register_module(
-                f"encoder.{i}", _ResidualBlock(hidden_dim, rng, optimized_linear_backward, requires_grad)
-            )
+            self.register_module(f"encoder.{i}", _ResidualBlock(hidden_dim, rng, linear, requires_grad, fused))
             for i in range(num_blocks)
         )
-        self.post_norm = self.register_module("post_norm", _UnitRMSNorm(hidden_dim, requires_grad))
+        self.post_norm = self.register_module("post_norm", _rms_norm(hidden_dim, requires_grad, fused))
 
     def features(self, input: wp.array) -> wp.array:
         output = self.embedder(input)
@@ -269,10 +454,10 @@ class _Backbone(_FlashNetwork):
 
 
 class _ActorHead(nn.Module):
-    def __init__(self, hidden_dim, action_dim, rng, optimized_linear_backward, requires_grad):
+    def __init__(self, hidden_dim, action_dim, rng, linear, requires_grad):
         super().__init__(requires_grad=requires_grad)
-        self.mean_w = _UnitLinear(hidden_dim, action_dim, rng, optimized_linear_backward, requires_grad)
-        self.std_w = _UnitLinear(hidden_dim, action_dim, rng, optimized_linear_backward, requires_grad)
+        self.mean_w = _UnitLinear(hidden_dim, action_dim, rng, linear, requires_grad)
+        self.std_w = _UnitLinear(hidden_dim, action_dim, rng, linear, requires_grad)
         self.mean_bias = nn.Parameter(wp.zeros(action_dim, device=self.device), requires_grad=requires_grad)
         self.std_bias = nn.Parameter(wp.zeros(action_dim, device=self.device), requires_grad=requires_grad)
         super().__post_init__()
@@ -314,14 +499,19 @@ class FlashActor(_Backbone):
         device: str | wp.Device | None = None,
         optimized_linear_backward: bool = True,
         requires_grad: bool = True,
+        dense_backend: str = "warp",
+        compute_dtype: str = "float32",
+        fused_updates: bool = False,
+        cuda_autotune: bool = False,
     ):
+        linear = _linear_type(dense_backend, optimized_linear_backward, compute_dtype, cuda_autotune)
         if min(observation_dim, action_dim, hidden_dim) <= 0 or num_blocks < 0:
             raise ValueError("Network dimensions must be positive and block count nonnegative.")
         with wp.ScopedDevice(device):
             rng = np.random.default_rng(seed)
-            super().__init__(observation_dim, hidden_dim, num_blocks, rng, optimized_linear_backward, requires_grad)
+            super().__init__(observation_dim, hidden_dim, num_blocks, rng, linear, requires_grad, fused_updates)
             self.predictor = self.register_module(
-                "predictor", _ActorHead(hidden_dim, action_dim, rng, optimized_linear_backward, requires_grad)
+                "predictor", _ActorHead(hidden_dim, action_dim, rng, linear, requires_grad)
             )
             self.observation_dim = observation_dim
             self.action_dim = action_dim
@@ -339,15 +529,23 @@ class FlashActor(_Backbone):
 
 
 class _ValueHead(nn.Module):
-    def __init__(self, hidden_dim, num_bins, min_v, max_v, rng, optimized_linear_backward, requires_grad):
+    def __init__(self, hidden_dim, num_bins, min_v, max_v, rng, linear, requires_grad, fused=False):
         super().__init__(requires_grad=requires_grad)
-        self.w = _UnitLinear(hidden_dim, num_bins, rng, optimized_linear_backward, requires_grad)
+        self.w = _UnitLinear(hidden_dim, num_bins, rng, linear, requires_grad)
         self.bias = nn.Parameter(wp.zeros(num_bins, device=self.device), requires_grad=requires_grad)
         self.bin_values = nn.Buffer(wp.array(np.linspace(min_v, max_v, num_bins, dtype=np.float32), device=self.device))
-        self.log_softmax = LogSoftmax(dim=-1, requires_grad=requires_grad)
+        self.fused = fused
+        if fused:
+            from robolearn.cuda.categorical import CudaCategorical
+
+            self.categorical = CudaCategorical(requires_grad=requires_grad)
+        else:
+            self.log_softmax = LogSoftmax(dim=-1, requires_grad=requires_grad)
         super().__post_init__()
 
     def __call__(self, input: wp.array) -> tuple[wp.array, wp.array]:
+        if self.fused:
+            return self.categorical(self.w(input), self.bias.data, self.bin_values.data)
         shape = (input.shape[0], self.bias.shape[0])
         if shape not in self._cache:
             self._cache[shape] = (
@@ -371,11 +569,11 @@ class _ValueHead(nn.Module):
 
 class _ValueNetwork(_Backbone):
     def __init__(
-        self, input_dim, hidden_dim, num_blocks, num_bins, min_v, max_v, rng, optimized_linear_backward, requires_grad
+        self, input_dim, hidden_dim, num_blocks, num_bins, min_v, max_v, rng, linear, requires_grad, fused=False
     ):
-        super().__init__(input_dim, hidden_dim, num_blocks, rng, optimized_linear_backward, requires_grad)
+        super().__init__(input_dim, hidden_dim, num_blocks, rng, linear, requires_grad, fused)
         self.predictor = self.register_module(
-            "predictor", _ValueHead(hidden_dim, num_bins, min_v, max_v, rng, optimized_linear_backward, requires_grad)
+            "predictor", _ValueHead(hidden_dim, num_bins, min_v, max_v, rng, linear, requires_grad, fused)
         )
 
     def __call__(self, input: wp.array) -> tuple[wp.array, wp.array]:
@@ -405,11 +603,17 @@ class FlashDoubleCritic(_FlashNetwork):
         device: str | wp.Device | None = None,
         optimized_linear_backward: bool = True,
         requires_grad: bool = True,
+        dense_backend: str = "warp",
+        compute_dtype: str = "float32",
+        fused_updates: bool = False,
+        cuda_autotune: bool = False,
     ):
+        linear = _linear_type(dense_backend, optimized_linear_backward, compute_dtype, cuda_autotune)
         if min(observation_dim, action_dim, hidden_dim) <= 0 or num_blocks < 0 or num_bins < 2 or min_v >= max_v:
             raise ValueError("Invalid categorical critic dimensions or support.")
         with wp.ScopedDevice(device):
             super().__init__(requires_grad=requires_grad)
+            self.fused_updates = fused_updates
             rng = np.random.default_rng(seed)
             self.critics = tuple(
                 self.register_module(
@@ -422,8 +626,9 @@ class FlashDoubleCritic(_FlashNetwork):
                         min_v,
                         max_v,
                         rng,
-                        optimized_linear_backward,
+                        linear,
                         requires_grad,
+                        fused_updates,
                     ),
                 )
                 for i in range(2)

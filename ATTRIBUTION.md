@@ -5,7 +5,7 @@ names refer to the work of their original authors, not an invention of this proj
 
 ## FlashSAC
 
-The PyTorch implementation in `src/robolearn/flashsac/` and experimental FP32
+The PyTorch implementation in `src/robolearn/flashsac/` and experimental
 Warp-NN implementation in `src/robolearn/warp/flashsac.py` and `_flash_*.py`
 are derived from
 [Holiday-Robot/FlashSAC](https://github.com/Holiday-Robot/FlashSAC), commit
@@ -30,6 +30,8 @@ Adaptations in this extraction:
   type aliases; added a dimensions-based Python API and configuration defaults.
 - Kept policy actions and transitions as PyTorch tensors on the device.
 - Made compilation opt-in and stored raw model state for eager/compiled checkpoint interoperability.
+- Match the authors' default-mode compilation of categorical and reward helpers
+  when enabled, with per-instance wrappers so eager agents remain independent.
 - Reset episode accumulators when loading reward statistics into a different environment count.
 - Stored effective bootstrap discounts for n-step returns interrupted by timeouts.
 - Added an Isaac Lab 3 adapter with pre-reset terminal observations.
@@ -39,8 +41,10 @@ Adaptations in this extraction:
 - Added an experimental Warp-NN implementation of the same residual architecture,
   categorical losses, entropy adaptation, reward normalization, exploration,
   update order, and n-step timeout semantics. Device buffers and CUDA capture
-  replace the Torch execution path. This backend uses FP32; it does not reproduce
-  Torch's AMP or random-number stream.
+  replace the Torch execution path. The default Warp backend uses FP32; the
+  optional native CUDA backend adds FP16 dense operands with FP32 state, dynamic
+  loss scaling, and fused normalization, projections and target EMA. These paths
+  do not reproduce Torch's AMP rounding or random-number stream.
 
 The Torch backend's checkpoints support weight and optimizer resume. Replay saving is
 optional, and pending n-step transitions, exploration noise, and RNG state are

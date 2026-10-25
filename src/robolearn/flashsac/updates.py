@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: MIT
 # Derived from Holiday-Robot/FlashSAC, revision 87edc9061150ae9e962dd84e6544e27a1554b3ab.
 
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import torch
 from torch.amp.grad_scaler import GradScaler
@@ -180,6 +180,9 @@ def update_critic(
     device: torch.device,
     use_amp: bool,
     grad_scaler: Optional[GradScaler],
+    *,
+    select_min_q_log_probs: Callable[..., torch.Tensor] = _select_min_q_log_probs,
+    categorical_td_target: Callable[..., torch.Tensor] = _compute_categorical_td_target,
 ) -> dict[str, torch.Tensor]:
     """Update critic network.
 
@@ -197,6 +200,8 @@ def update_critic(
         device: Device to use.
         use_amp: Whether to use automatic mixed precision.
         grad_scaler: GradScaler for FP16 AMP.
+        select_min_q_log_probs: Eager or per-agent compiled min-Q selection.
+        categorical_td_target: Eager or per-agent compiled categorical projection.
     """
 
     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
@@ -225,10 +230,10 @@ def update_critic(
             )
             next_qs = qs_all.chunk(2, dim=1)[1]
             next_q_log_probs = q_infos_all["log_prob"].chunk(2, dim=1)[1]
-            next_q_log_probs = _select_min_q_log_probs(next_qs, next_q_log_probs)
+            next_q_log_probs = select_min_q_log_probs(next_qs, next_q_log_probs)
 
             # Compute target probs
-            target_probs = _compute_categorical_td_target(
+            target_probs = categorical_td_target(
                 target_log_probs=next_q_log_probs,
                 reward=batch["reward"],  # type: ignore
                 done=batch["terminated"],  # type: ignore

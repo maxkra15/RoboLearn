@@ -83,8 +83,14 @@ class RewardNormalizer:
         load_rms: bool,
         device: torch.device,
         epsilon: float = 1e-8,
+        *,
+        compile_helpers: bool = False,
     ):
         self.gamma = gamma
+        # Match the authors' default-mode helper compilation while preserving
+        # the explicitly eager path and independent normalizer instances.
+        self._update_reward_stats = torch.compile(_update_reward_stats) if compile_helpers else _update_reward_stats
+        self._scale_reward = torch.compile(_scale_reward) if compile_helpers else _scale_reward
         # running estimates of the discounted return
         self.G_r = torch.zeros(1, dtype=torch.float32, device=device)  # Lazy init to num_envs
         self.G_r_max = torch.zeros(1, dtype=torch.float32, device=device)
@@ -92,6 +98,7 @@ class RewardNormalizer:
             shape=(1,),
             device=device,
             dtype=torch.float32,
+            compile_helpers=compile_helpers,
         )
         self.G_max = G_max
         self.load_rms = load_rms
@@ -104,7 +111,7 @@ class RewardNormalizer:
         terminated: torch.Tensor,
         truncated: torch.Tensor,
     ) -> None:
-        self.G_r, self.G_r_max = _update_reward_stats(
+        self.G_r, self.G_r_max = self._update_reward_stats(
             reward=reward,
             terminated=terminated,
             truncated=truncated,
@@ -115,7 +122,7 @@ class RewardNormalizer:
         self.G_rms.update(self.G_r)
 
     def normalize_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
-        normalized_rewards = _scale_reward(
+        normalized_rewards = self._scale_reward(
             rewards=rewards,
             G_var=self.G_rms.var,
             G_r_max=self.G_r_max,
@@ -164,6 +171,8 @@ class RunningMeanStd:
         epsilon: float = 1e-4,
         shape: tuple[int, ...] = (),
         dtype: torch.dtype = torch.float32,
+        *,
+        compile_helpers: bool = False,
     ):
         """Tracks the mean, variance and count of values."""
         self.mean = torch.zeros(shape, dtype=dtype, device=device)
@@ -171,10 +180,15 @@ class RunningMeanStd:
         self.count = torch.tensor(0.0, dtype=dtype, device=device)
         self.epsilon = epsilon
         self.device = device
+        self._update_moments = (
+            torch.compile(_update_mean_var_count_from_moments)
+            if compile_helpers
+            else _update_mean_var_count_from_moments
+        )
 
     def update(self, x: torch.Tensor) -> None:
         """Updates the mean, var and count from a batch of samples."""
-        self.mean, self.var, self.count = _update_mean_var_count_from_moments(
+        self.mean, self.var, self.count = self._update_moments(
             samples=x,
             running_mean=self.mean,
             running_var=self.var,
