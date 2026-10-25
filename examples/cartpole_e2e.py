@@ -375,11 +375,17 @@ class Learner:
 
         if not self.is_ppo:
             if self.native:
-                return {
-                    key: value
-                    for key, value in self.agent.state_dict().items()
-                    if key.startswith(("actor.", "critic.", "target_critic.", "log_temperature"))
+                values = {
+                    f"{name}.{key}": value.numpy().copy()
+                    for name, network in (
+                        ("actor", self.agent.actor),
+                        ("critic", self.agent.critic),
+                        ("target_critic", self.agent.target_critic),
+                    )
+                    for key, value in network.state_dict().items()
                 }
+                values["log_temperature"] = self.agent.log_temperature.numpy().copy()
+                return values
             return torch_state(self.agent)
         if not self.native:
             return model_arrays(self.agent)
