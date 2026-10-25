@@ -186,7 +186,7 @@ class Learner:
         self.is_ppo = self.recipe in ("rsl_ppo", "cuda_ppo")
         self.native = self.recipe.startswith("cuda")
         self.num_envs, self.device, self.TensorDict = num_envs, args.device, TensorDict
-        self.stream = wp.stream_from_torch(torch.cuda.current_stream(args.device)) if self.native else None
+        self.stream = wp.get_stream(args.device) if self.native else None
         self.provenance = {}
         torch.manual_seed(args.seed)
         if self.is_ppo:
@@ -256,9 +256,15 @@ class Learner:
 
     @contextmanager
     def scope(self):
+        import torch
         import warp as wp
 
         if self.native:
+            require(
+                bool(self.stream.cuda_stream)
+                and torch.cuda.current_stream(self.device).cuda_stream == self.stream.cuda_stream,
+                "Native collection and learning must use the GPU worker's shared Torch/Warp stream",
+            )
             with wp.ScopedStream(self.stream, sync_enter=False):
                 yield
         else:
@@ -475,6 +481,29 @@ def flatten(value, prefix=""):
         name = f"{prefix}.{key}" if prefix else key
         result.update(flatten(item, name) if isinstance(item, dict) else {name: item})
     return result
+
+
+@contextmanager
+def gpu_worker_stream(args):
+    """Keep physics, Torch collection and learning on one capture-capable stream."""
+    if args.phase not in ("fixture", "train-worker", "evaluate-worker"):
+        yield
+        return
+
+    import torch
+    import warp as wp
+
+    wp.init()
+    stream = wp.Stream(args.device)
+    mirror = wp.stream_to_torch(stream)
+    stream.wait_stream(wp.get_stream(args.device))
+    mirror.wait_stream(torch.cuda.current_stream(args.device))
+    with wp.ScopedStream(stream, sync_enter=False), torch.cuda.stream(mirror):
+        try:
+            yield
+        finally:
+            # Keep both owners alive until all work, including cleanup, completes.
+            wp.synchronize_stream(stream)
 
 
 def runtime(args):
@@ -1335,13 +1364,14 @@ if __name__ == "__main__":
     arguments = parse_args()
     try:
         specification = read_spec(arguments)
-        {
-            "fixture": fixture,
-            "train-worker": train_worker,
-            "evaluate-worker": evaluate_worker,
-            "smoke": controller,
-            "run": controller,
-        }[arguments.phase](arguments, specification)
+        with gpu_worker_stream(arguments):
+            {
+                "fixture": fixture,
+                "train-worker": train_worker,
+                "evaluate-worker": evaluate_worker,
+                "smoke": controller,
+                "run": controller,
+            }[arguments.phase](arguments, specification)
     except Exception as error:
         write_json(
             arguments.output / "failure.json",
