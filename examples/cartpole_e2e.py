@@ -649,6 +649,11 @@ def fixture(args, spec):
     ):
         wrapper.reset(seed=spec["evaluation"]["common_seed"])
         observations = wrapper.reset(seed=spec["evaluation"]["common_seed"])
+        require(
+            torch.count_nonzero(wrapper.env.scene["robot"].actuators.target_command.velocity.torch).item() == 0,
+            "Ordinary effort-controlled Cartpole resets must keep a zero joint velocity target",
+        )
+        metadata["evaluation_zero_velocity_target_verified"] = True
         metadata["evaluation_observation_hash"] = array_hash(observations.cpu().numpy())
         state = tree_map(wrapper.env.scene.get_state(is_relative=True), lambda value: value.detach().cpu().clone())
         torch.save(state, args.output / "evaluation-state.pt")
@@ -985,13 +990,18 @@ def evaluate_episode(learner, wrapper, state, settings):
     import torch
 
     groups, _ = wrapper.env.reset_to(state, seed=settings["common_seed"], is_relative=True)
+    robot = wrapper.env.scene["robot"]
+    # reset_to also seeds PD targets from the saved velocities. Effort-controlled
+    # Cartpole must retain the ordinary zero target for its kd=10 cart damping.
+    robot.actuators.target_command.set_velocity_index(
+        value=torch.zeros_like(state["articulation"]["robot"]["joint_velocity"])
+    )
     observations = wrapper._observations(groups).clone()
     observation_hash = array_hash(observations.cpu().numpy())
     actual_state = tree_map(wrapper.env.scene.get_state(is_relative=True), lambda value: value.detach().cpu().clone())
     hashes = state_hashes({name: value.numpy() for name, value in flatten(actual_state).items()})
     expected = state_hashes({name: value.detach().cpu().numpy() for name, value in flatten(state).items()})
     require(hashes == expected, "Canonical evaluation state was not restored bit exactly")
-    robot = wrapper.env.scene["robot"]
     cart = robot.find_joints("slider_to_cart")[0]
     pole = robot.find_joints("cart_to_pole")[0]
     require(len(cart) == len(pole) == 1, "Cart/pole joint lookup was ambiguous")
