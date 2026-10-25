@@ -73,7 +73,7 @@ sac = WarpFlashSAC(
     cfg=FlashSACConfig(device="cuda:0", use_amp=True, use_compile=False),
     dense_backend="cuda",
     fused_updates=True,
-    fresh_training_gradients=False,
+    fresh_training_gradients=True,  # Optional; the public default is False.
 )
 sac.prepare(capture=True)
 ```
@@ -82,7 +82,8 @@ These snippets select backend options; they are not complete matched G1 training
 recipes. See the [PPO](warp.md) and [FlashSAC](warp_flashsac.md) guides for learner
 inputs, transitions and update usage. Leave `use_amp=False` for FP32, or
 `fused_updates=False` for the original Warp normalization path. Fusion and AMP
-are disabled by default.
+are disabled by default. Set `fresh_training_gradients=False` before disabling
+AMP or fusion.
 
 Compilation is lazy at first preparation. An explicit architecture permits a
 build without querying or using a GPU:
@@ -211,6 +212,11 @@ categories/counts are not conserved counts of algorithmic work or causal speedup
 
 <a id="comparison-with-upstream-learners-23-october-2026"></a>
 
+- [25 October repeated FlashSAC comparison](https://maxkra15.github.io/reports/2026-10-25-flashsac-consistency/)
+  compares optional fresh-gradient native FP16 dense / FP32 state with official
+  compiled Torch AMP on two L40 allocations. Earlier A/B/C target misses remain
+  linked in the report. Measurements cover complete learner updates and CPU
+  scalar metrics; they do not measure physics or policy quality.
 - [24 October CUDA FlashSAC report](https://maxkra15.github.io/reports/2026-10-24-flashsac-cuda/)
   records frozen implementations, numerical recipes and single-allocation timings.
 - [20 October G1 report](https://maxkra15.github.io/reports/2026-10-20-g1-main-baselines/)

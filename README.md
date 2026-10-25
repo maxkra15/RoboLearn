@@ -120,6 +120,12 @@ This is experimental; inspect the numerical and timing results before adopting i
 The [upstream learner comparison](docs/cuda.md#comparison-with-upstream-learners-23-october-2026)
 measures actual RSL-RL PPO and official FlashSAC alongside RoboLearn's backends.
 
+The [25 October report](https://maxkra15.github.io/reports/2026-10-25-flashsac-consistency/)
+compares fresh-gradient native FP16 dense / FP32 state with official compiled
+Torch AMP on two L40 allocations. It retains earlier missed targets and measures
+complete learner updates, including scalar metrics; it does not measure physics
+or policy quality.
+
 ## Credits
 
 **FlashSAC** — Donghu Kim, Youngdo Lee, Minho Park, Kinam Kim, I Made Aswin Nahendra,

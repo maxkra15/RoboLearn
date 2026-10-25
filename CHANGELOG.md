@@ -2,40 +2,27 @@
 
 ## Unreleased
 
-- Reuse consumer-owned FP16 buffers at private native FlashSAC BatchNorm/dense
-  edges, preserving FP32 outputs, accumulated adjoints and explicit-conversion rounding.
-- Add opt-in `fresh_training_gradients` for verified private residual adjoints,
-  with ownership checks, ordinary accumulation/full-clear fallback and host activation
-  metadata. Keep complete clearing by default; expose the option in balanced comparisons.
-
+- Add optional experimental native CUDA FP32 dense forward/backward and fused
+  multi-tensor Adam for Warp PPO and Warp FlashSAC, preserving networks, losses,
+  optimizer arrays and the default Warp backend.
+- Add native FlashSAC FP16 dense operands with FP32 outputs and optimizer state,
+  dynamic loss scaling and checkpointed attempt/skip counters. Fuse normalization,
+  ReLU, categorical operations, parameter projections and target EMA.
+- Reuse owned FP16 conversion buffers and batch verified gradient clears. Add
+  opt-in `fresh_training_gradients` for private residual adjoints, with ownership
+  checks, activation metadata and ordinary accumulation/full-clear fallback;
+  complete clearing remains the default.
+- Add preparation-only cuBLASLt tuning with private scratch, fixed captured plans
+  and recorded choices, plus balanced FlashSAC benchmarks with matched initial
+  state and update counts.
+- Add standalone numerical, capture and checkpoint diagnostics and synthetic
+  update benchmarks; performance and learning quality require measured results.
 - Align optional Torch FlashSAC compilation with the authors' categorical and
-  reward helpers while preserving the eager path and per-transition discounts.
-
-- Add opt-in preparation-time cuBLASLt plan tuning with private scratch buffers,
-  fixed captured choices, and recorded candidate timings. Add a balanced
-  fresh-process FlashSAC comparison with matched initialization and update counts.
-
-- Batch experimental native FlashSAC adjoint clears with verified persistent
-  pointer inventories and reduce BatchNorm backward coefficients once per channel.
-
-- Optimized experimental native FlashSAC with projection/EMA-managed FP16 weight
-  copies, vectorized conversions, tiled batch normalization, and cooperative
-  categorical heads and target projection.
-
-- Added opt-in FP16 dense compute with FP32 master weights and Adam, dynamic
-  loss scaling, and fused normalization/ReLU, parameter projections and target
-  EMA for the experimental native FlashSAC backend.
-- Added opt-in experimental native CUDA dense forward/backward and fused
-  multi-tensor Adam for Warp PPO and Warp FlashSAC, with unchanged architectures,
-  loss definitions, optimizer state arrays, and default Warp backend.
-- Added standalone numerical diagnostics and synthetic update benchmarks for
-  the CUDA backend; performance and learning quality require measured results.
-- Load Warp learners lazily so selecting PPO does not import experimental FlashSAC.
-- Allow `PPOConfig` imports without installing Torch, Warp, or Warp-NN; preserve
-  existing public imports and configuration defaults.
-- Emit an explicit experimental-backend warning when constructing Warp FlashSAC.
-- Document Isaac Lab logging/checkpoint support, measured FlashSAC bottlenecks,
-  and the separate requirements for learning through simulator gradients.
+  reward helpers, preserving eager execution and per-transition discounts.
+- Keep learner imports lazy and `PPOConfig` independent of optional dependencies;
+  explicitly warn that Warp FlashSAC is experimental.
+- Document Isaac Lab logging/checkpoints, backend constraints and the separate
+  requirements for learning through simulator gradients.
 
 ## 0.3.0 - 2026-10-09
 
