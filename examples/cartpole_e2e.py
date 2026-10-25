@@ -132,6 +132,11 @@ def make_rsl(num_envs, observations, actions, device, config):
     actor_cfg, critic_cfg, algorithm_cfg = (copy.deepcopy(config[key]) for key in ("actor", "critic", "algorithm"))
     for item in (actor_cfg, critic_cfg, algorithm_cfg):
         item.pop("class_name")
+    # PPO.construct_algorithm consumes this model-construction option before PPO.__init__.
+    require(
+        not algorithm_cfg.pop("share_cnn_encoders", None),
+        "The Cartpole comparison requires independent MLPs without shared CNN encoders",
+    )
     actor_cfg["distribution_cfg"]["class_name"] = "rsl_rl.modules:GaussianDistribution"
     actor = MLPModel(sample, groups, "actor", actions, **actor_cfg)
     critic = MLPModel(sample, groups, "critic", 1, **critic_cfg)
