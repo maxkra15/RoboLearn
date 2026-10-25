@@ -550,12 +550,16 @@ def environment(args, spec, num_envs, seed):
         "The imported Isaac Lab root differs from the frozen checkout",
     )
     cfg = parse_env_cfg(
-        spec["mdp"]["task"], device=args.device, num_envs=num_envs, overrides=["physics=newton_mjwarp", "renderer=none"]
+        spec["mdp"]["task"],
+        device=args.device,
+        num_envs=num_envs,
+        overrides=["physics=newton_mjwarp", "visualizer=none"],
     )
     cfg.compute_final_obs = True
     cfg.seed = seed
     require(math.isclose(cfg.sim.dt, spec["mdp"]["physics_dt"]), "Unexpected stock physics timestep")
     require(cfg.decimation == spec["mdp"]["control_decimation"], "Unexpected stock control decimation")
+    require(all(not viewer.backend for viewer in cfg.sim.visualizer_cfgs), "Headless comparison must disable viewers")
     task_root = args.isaaclab_root / "source/isaaclab_tasks/isaaclab_tasks/core/cartpole"
     task_hashes = {
         path.relative_to(args.isaaclab_root).as_posix(): sha(path) for path in sorted(task_root.rglob("*.py"))
@@ -567,6 +571,7 @@ def environment(args, spec, num_envs, seed):
         "task": spec["mdp"]["task"],
         "physics": "newton_mjwarp",
         "renderer": "none",
+        "visualizer": "none",
         "task_files_sha256": task_hashes,
         "runtime_contract_files_sha256": {
             name: sha(args.isaaclab_root / name)
@@ -598,6 +603,7 @@ def environment(args, spec, num_envs, seed):
         },
     }
     with launch_simulation(cfg):
+        require(not cfg.sim.visualizer_cfgs, "Runtime preparation enabled an unexpected visualizer")
         env = gym.make(spec["mdp"]["task"], cfg=cfg).unwrapped
         wrapper = IsaacLabEnv(env, clip_actions=1.0)
         require((wrapper.observation_dim, wrapper.action_dim) == (4, 1), "Unexpected Cartpole MDP dimensions")
