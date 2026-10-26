@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 RoboLearn contributors
 # SPDX-License-Identifier: MIT
-"""Run a frozen, four-recipe Isaac Lab Cartpole learning comparison.
+"""Run a frozen Isaac Lab Cartpole learning comparison.
 
 Use an installed Isaac Lab environment, the reviewed protocol JSON and pristine
 FlashSAC source. ``fixture`` exports shared initial policies and evaluation state;
-``smoke`` exercises every learner before ``run`` starts fresh training/evaluation
-processes in the allocation's prescribed order. Smokes never enter production
+``smoke`` exercises each selected learner before ``run`` starts fresh training
+and evaluation processes in the allocation's prescribed order. Smokes never enter production
 results. Newton physics and native learning use separate graphs; the Torch MDP
 and collection loop are not one captured physics/learning graph.
 
@@ -63,6 +63,34 @@ def read_spec(args):
     require(
         spec["recipes"]["official_flashsac"]["n_step"] == 1, "One-step replay is required for matched timeout targets"
     )
+    recipes = spec["schedule"]["recipe_order"]
+    require(
+        bool(recipes)
+        and len(recipes) == len(set(recipes))
+        and set(recipes) == set(spec["recipes"])
+        and all(recipe in RECIPES for recipe in recipes),
+        "Protocol recipe population differs from the selected implementations",
+    )
+    require(
+        all(sorted(row) == list(range(len(recipes))) for row in spec["schedule"]["williams_rows"]),
+        "Every execution-order row must contain every selected recipe exactly once",
+    )
+    require(args.recipe is None or args.recipe in recipes, "Worker recipe is absent from the protocol")
+    require(args.allocation in spec["schedule"], "Allocation is absent from the protocol")
+    require(
+        args.phase != "fixture" or "canonical_fixtures" not in spec,
+        "This protocol reuses frozen canonical fixtures; regeneration is not permitted",
+    )
+    checkpointing = spec.get("checkpointing", {})
+    if checkpointing.get("full_replay_in_final_continuation_checkpoint", False):
+        require(
+            checkpointing["continuation_iteration"] == spec["budget"]["iterations"]
+            and spec["budget"]["iterations"] in spec["budget"]["checkpoint_iterations"]
+            and all(recipe.endswith("flashsac") for recipe in recipes),
+            "Full replay export requires the final scored FlashSAC checkpoint",
+        )
+        name = checkpointing["continuation_directory_name"]
+        require(name not in ("", ".", "..") and Path(name).name == name, "Unsafe continuation directory name")
     return spec
 
 
@@ -710,9 +738,16 @@ def fixture(args, spec):
 
 
 def verify_fixtures(directory, protocol):
+    spec = json.loads(protocol.read_text())
+    adopted = spec.get("canonical_fixtures")
     ready = json.loads((directory / "fixture-ready.json").read_text())
-    require(ready["manifest_sha256"] == sha(directory / "SHA256SUMS"), "Canonical fixture manifest mismatch")
-    require(ready["protocol_sha256"] == sha(protocol), "Canonical fixture protocol mismatch")
+    manifest_hash = sha(directory / "SHA256SUMS")
+    require(ready["status"] == "FIXTURES_READY", "Canonical fixture producer was incomplete")
+    require(ready["manifest_sha256"] == manifest_hash, "Canonical fixture manifest mismatch")
+    require(
+        ready["protocol_sha256"] == (adopted["protocol_sha256"] if adopted else sha(protocol)),
+        "Canonical fixture protocol mismatch",
+    )
     expected = {"SHA256SUMS", "fixture-ready.json"}
     for row in (directory / "SHA256SUMS").read_text().splitlines():
         digest, name = row.split("  ", 1)
@@ -729,15 +764,30 @@ def verify_fixtures(directory, protocol):
         {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file()} == expected,
         "Canonical fixture inventory mismatch",
     )
-    return json.loads((directory / "fixtures.json").read_text())
+    metadata = json.loads((directory / "fixtures.json").read_text())
+    require(
+        metadata["status"] == "COMPLETED"
+        and metadata["protocol_sha256"] == ready["protocol_sha256"]
+        and metadata["evaluation_zero_velocity_target_verified"] is True,
+        "Canonical fixture metadata or stock zero velocity target differs",
+    )
+    if adopted:
+        require(manifest_hash == adopted["manifest_sha256"], "Adopted fixture manifest differs")
+        require(metadata["runtime"]["driver_sha256"] == adopted["driver_sha256"], "Adopted fixture source differs")
+        require(
+            {name: sha(directory / name) for name in expected} == adopted["files_sha256"]
+            and {name: (directory / name).stat().st_size for name in expected} == adopted["files_bytes"],
+            "Adopted fixture whole inventory differs from the reviewed original",
+        )
+    return metadata
 
 
-def checkpoint(learner, args, iteration, transitions, loop_seconds):
+def checkpoint(learner, args, iteration, transitions, loop_seconds, *, continuation_directory=None):
     started = time.perf_counter()
     directory = args.output / "checkpoints" / f"iteration-{iteration:04d}"
     hashes = learner.save(directory)
     finished = time.perf_counter()
-    return {
+    record = {
         "iteration": iteration,
         "transitions": transitions,
         "path": str(directory.relative_to(args.output)),
@@ -749,6 +799,30 @@ def checkpoint(learner, args, iteration, transitions, loop_seconds):
         "fresh": learner.fresh(),
         "write_seconds": time.perf_counter() - started,
     }
+    if continuation_directory is not None:
+        # Keep the scored policy checkpoint portable to the 128-world evaluator;
+        # full native replay continuation requires the original training worlds.
+        continuation_started = time.perf_counter()
+        continuation_path = args.output / continuation_directory
+        continuation_files = learner.save(continuation_path, replay=True)
+        continuation_finished = time.perf_counter()
+        require(state_hashes(learner.model()) == record["model_hashes"], "Replay export changed the final policy")
+        require(learner.counts() == record["optimizer"], "Replay export changed the final optimizer counters")
+        record["continuation"] = {
+            "iteration": iteration,
+            "transitions": transitions,
+            "path": str(continuation_path.relative_to(args.output)),
+            "files_sha256": continuation_files,
+            "files_bytes": {name: (continuation_path / name).stat().st_size for name in continuation_files},
+            "model_hashes": record["model_hashes"],
+            "optimizer": record["optimizer"],
+            "replay_included": True,
+            "num_envs": learner.num_envs,
+            "write_seconds": continuation_finished - continuation_started,
+            "process_write_finished_seconds": continuation_finished - PROCESS_STARTED,
+        }
+        record["write_seconds"] = time.perf_counter() - started
+    return record
 
 
 def collect_iteration(learner, wrapper, observations, horizon, uniform_generator):
@@ -893,7 +967,24 @@ def train_worker(args, spec):
                 "optimizer": learner.counts(),
             }
             if iteration in checkpoints:
-                saved = checkpoint(learner, args, iteration, transitions, time.perf_counter() - loop_started)
+                settings = spec.get("checkpointing", {})
+                continuation = (
+                    settings["continuation_directory_name"]
+                    if not args.smoke
+                    and settings.get("full_replay_in_final_continuation_checkpoint", False)
+                    and iteration == settings["continuation_iteration"] == iterations
+                    else None
+                )
+                saved = checkpoint(
+                    learner,
+                    args,
+                    iteration,
+                    transitions,
+                    time.perf_counter() - loop_started,
+                    continuation_directory=continuation,
+                )
+                if "continuation" in saved:
+                    result["final_continuation"] = saved.pop("continuation")
                 timing["checkpoint_seconds"] += saved["write_seconds"]
                 result["checkpoints"].append(saved)
             record["iteration_seconds"] = time.perf_counter() - iteration_started
@@ -975,7 +1066,7 @@ def train_worker(args, spec):
         "collection_host_seconds": "Policy inference + public action API/CPU transfer + common action clip + env.step + transition observe/insertion. Includes host waits; not pure physics.",
         "learning_host_seconds": "Actual optimizer/update API and scalar metrics; interleaved Flash calls excluded from collection section. Includes host waits.",
         "primary": "Synchronized iteration/whole-process wall; phase host/dispatch durations are not GPU-only timings and do not include the final iteration barrier.",
-        "nested": "Checkpoint/metrics IO are inside training_loop_seconds. Preparation includes native kernel build, warmup and capture, but official lazy compilation remains in constructor/first collection/updates.",
+        "nested": "Checkpoint/metrics IO are inside training_loop_seconds, including any final full-replay export. Portable policy availability timestamps precede that separate export. Preparation includes native kernel build, warmup and capture, but official lazy compilation remains in constructor/first collection/updates.",
     }
     write_json(args.output / "train.json", result)
 
@@ -1257,15 +1348,17 @@ def controller(args, spec):
         prior = json.loads((args.output.parent / "smoke" / "comparison.json").read_text())
         require(
             prior["status"] == "COMPLETED"
-            and len(prior["smokes"]) == 4
+            and [row["recipe"] for row in prior["smokes"]] == spec["schedule"]["recipe_order"]
             and prior["protocol_sha256"] == sha(args.protocol),
-            "Production requires the completed four-recipe smoke first",
+            "Production requires the completed selected-recipe smoke first",
         )
     seeds = [0] if smoke else spec["budget"]["seeds"]
     schedule = []
     for seed in seeds:
         row_index = 0 if smoke else spec["schedule"][args.allocation]["williams_row_by_seed"][seed]
-        indices = range(4) if smoke else spec["schedule"]["williams_rows"][row_index]
+        indices = (
+            range(len(spec["schedule"]["recipe_order"])) if smoke else spec["schedule"]["williams_rows"][row_index]
+        )
         for position, index in enumerate(indices):
             schedule.append(
                 {
