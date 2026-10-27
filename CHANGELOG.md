@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add a four-learner stock Franka cable comparison with common full-state
+  evaluation, full cable gravity, and stock RSL observation normalization around
+  native PPO. Reuse collection, timing, and checkpoint audits without changing
+  learner kernels or the task's training curriculum.
+
 - Add optional experimental native CUDA FP32 dense forward/backward and fused
   multi-tensor Adam for Warp PPO and Warp FlashSAC, preserving networks, losses,
   optimizer arrays and the default Warp backend.

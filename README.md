@@ -101,6 +101,15 @@ not establish G1 learning quality for that backend. See the
 [performance explanation](docs/warp_flashsac.md#current-performance-2026-10-20),
 [historical G1 comparison](docs/g1.md), and [earlier validation](docs/validation.md).
 
+The [Franka cable comparison](examples/franka_cable_e2e.py) runs the stock
+`Isaac-Lift-Cable-Franka` state task with actual RSL-RL PPO, native CUDA PPO,
+pristine upstream Torch FlashSAC, and native CUDA FlashSAC. It reuses the common
+collector and checkpoint audits, preserves stock PPO observation normalization
+and unclipped actions, and evaluates common robot/cable states at full gravity.
+Its `fixture`, `smoke`, and `run` phases require an explicit frozen protocol,
+Isaac Lab checkout, upstream FlashSAC checkout, and output directory. These
+experiment helpers stay outside the installed learning library.
+
 ## Differentiable learning
 
 PPO already differentiates its policy and value networks. Using gradients through

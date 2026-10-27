@@ -142,10 +142,10 @@ def same(left, right):
     return left == right
 
 
-def stock_config():
+def stock_config(task="Isaac-Cartpole"):
     from isaaclab_tasks.utils import load_cfg_from_registry
 
-    return load_cfg_from_registry("Isaac-Cartpole", "rsl_rl_cfg_entry_point").to_dict()
+    return load_cfg_from_registry(task, "rsl_rl_cfg_entry_point").to_dict()
 
 
 def make_rsl(num_envs, observations, actions, device, config):
@@ -163,7 +163,7 @@ def make_rsl(num_envs, observations, actions, device, config):
     # PPO.construct_algorithm consumes this model-construction option before PPO.__init__.
     require(
         not algorithm_cfg.pop("share_cnn_encoders", None),
-        "The Cartpole comparison requires independent MLPs without shared CNN encoders",
+        "The state based comparison requires independent MLPs without shared CNN encoders",
     )
     actor_cfg["distribution_cfg"]["class_name"] = "rsl_rl.modules:GaussianDistribution"
     actor = MLPModel(sample, groups, "actor", actions, **actor_cfg)
@@ -181,7 +181,11 @@ def flash_config(spec, seed, device, smoke=False):
         seed=seed,
         gamma=settings["gamma"],
         n_step=1,
-        buffer_max_length=settings["buffer_capacity"],
+        buffer_max_length=(
+            spec.get("smoke", {}).get("flash_buffer_capacity", settings["buffer_capacity"])
+            if smoke
+            else settings["buffer_capacity"]
+        ),
         buffer_min_length=512 if smoke else settings["buffer_warmup_transitions"],
         sample_batch_size=256 if smoke else settings["batch_size"],
         learning_rate_decay_step=settings["learning_rate_decay_step"],
@@ -218,7 +222,7 @@ class Learner:
         self.provenance = {}
         torch.manual_seed(args.seed)
         if self.is_ppo:
-            self.config = stock_config()
+            self.config = stock_config(spec["mdp"]["task"])
             require(self.config["num_steps_per_env"] == spec["budget"]["rollout_steps"], "Stock PPO horizon differs")
             if self.native:
                 algorithm, actor = self.config["algorithm"], self.config["actor"]
@@ -737,7 +741,7 @@ def fixture(args, spec):
     print(f"FIXTURES_READY {args.output} {sha(manifest)}", flush=True)
 
 
-def verify_fixtures(directory, protocol):
+def verify_fixtures(directory, protocol, *, zero_velocity_target=True):
     spec = json.loads(protocol.read_text())
     adopted = spec.get("canonical_fixtures")
     ready = json.loads((directory / "fixture-ready.json").read_text())
@@ -768,7 +772,7 @@ def verify_fixtures(directory, protocol):
     require(
         metadata["status"] == "COMPLETED"
         and metadata["protocol_sha256"] == ready["protocol_sha256"]
-        and metadata["evaluation_zero_velocity_target_verified"] is True,
+        and (not zero_velocity_target or metadata.get("evaluation_zero_velocity_target_verified") is True),
         "Canonical fixture metadata or stock zero velocity target differs",
     )
     if adopted:
@@ -830,18 +834,30 @@ def collect_iteration(learner, wrapper, observations, horizon, uniform_generator
     import torch
 
     collection, learning, eligible, actions_finite = 0.0, 0.0, 0, True
+    reward_sum = torch.zeros((), device=learner.device)
+    terminated_sum = torch.zeros((), device=learner.device, dtype=torch.int64)
+    truncated_sum = torch.zeros_like(terminated_sum)
     metrics = {}
     for step in range(horizon):
         started = time.perf_counter()
         with torch.no_grad():
             if not learner.is_ppo and not learner.ready:
-                actions = torch.rand((wrapper.num_envs, 1), device=learner.device, generator=uniform_generator) * 2 - 1
+                actions = (
+                    torch.rand(
+                        (wrapper.num_envs, wrapper.action_dim), device=learner.device, generator=uniform_generator
+                    )
+                    * 2
+                    - 1
+                )
             else:
                 actions = learner.actions(observations)
             # This device reduction is read once at the iteration boundary.
             valid = torch.isfinite(actions).all()
             actions_finite = valid if isinstance(actions_finite, bool) else actions_finite & valid
             after, transition = wrapper.step(actions)
+            reward_sum += transition["reward"].sum()
+            terminated_sum += transition["terminated"].sum()
+            truncated_sum += transition["truncated"].sum()
             actions_finite &= torch.isfinite(after).all() & torch.isfinite(transition["reward"]).all()
             actions_finite &= torch.isfinite(transition["next_observation"]).all()
             learner.observe(observations, after, transition, step)
@@ -868,6 +884,9 @@ def collect_iteration(learner, wrapper, observations, horizon, uniform_generator
             "collection_host_seconds": collection,
             "learning_host_seconds": learning,
             "eligible_update_vector_steps": eligible,
+            "mean_transition_reward": float(reward_sum.item()) / (horizon * wrapper.num_envs),
+            "terminated_episodes": int(terminated_sum.item()),
+            "truncated_episodes": int(truncated_sum.item()),
         },
     )
 
@@ -887,12 +906,14 @@ def payload(directory):
     return result
 
 
-def train_worker(args, spec):
+def train_worker(
+    args, spec, *, environment_factory=environment, learner_factory=Learner, fixture_validator=verify_fixtures
+):
     import numpy as np
     import torch
     from benchmark_official_flashsac import fresh_optimizer_state
 
-    fixtures = verify_fixtures(args.fixtures, args.protocol)
+    fixtures = fixture_validator(args.fixtures, args.protocol)
     args.output.mkdir(parents=True, exist_ok=False)
     result = {
         "status": "STARTED",
@@ -917,11 +938,11 @@ def train_worker(args, spec):
         "checkpoint_seconds": 0.0,
         "metrics_io_seconds": 0.0,
     }
-    with environment(args, spec, num_envs, args.seed) as (wrapper, metadata):
+    with environment_factory(args, spec, num_envs, args.seed) as (wrapper, metadata):
         result["environment"] = metadata
         timing["environment_startup_seconds"] = metadata["startup_seconds"]
         started = time.perf_counter()
-        learner = Learner(args, spec, num_envs)
+        learner = learner_factory(args, spec, num_envs, wrapper.observation_dim, wrapper.action_dim)
         timing["learner_constructor_seconds"] = time.perf_counter() - started
         policy = f"{'ppo' if learner.is_ppo else 'flashsac'}-seed{args.seed}.npz"
         audit = learner.initialize(args.fixtures / policy)
@@ -973,6 +994,7 @@ def train_worker(args, spec):
                     if not args.smoke
                     and settings.get("full_replay_in_final_continuation_checkpoint", False)
                     and iteration == settings["continuation_iteration"] == iterations
+                    and not learner.is_ppo
                     else None
                 )
                 saved = checkpoint(
@@ -1063,7 +1085,7 @@ def train_worker(args, spec):
     timing["process_seconds"] = time.perf_counter() - PROCESS_STARTED
     result["timing"], result["status"] = timing, "COMPLETED"
     result["timing_scope"] = {
-        "collection_host_seconds": "Policy inference + public action API/CPU transfer + common action clip + env.step + transition observe/insertion. Includes host waits; not pure physics.",
+        "collection_host_seconds": "Policy inference + public action API/CPU transfer + common action boundary + env.step + transition observe/insertion. Includes host waits; not pure physics.",
         "learning_host_seconds": "Actual optimizer/update API and scalar metrics; interleaved Flash calls excluded from collection section. Includes host waits.",
         "primary": "Synchronized iteration/whole-process wall; phase host/dispatch durations are not GPU-only timings and do not include the final iteration barrier.",
         "nested": "Checkpoint/metrics IO are inside training_loop_seconds, including any final full-replay export. Portable policy availability timestamps precede that separate export. Preparation includes native kernel build, warmup and capture, but official lazy compilation remains in constructor/first collection/updates.",
@@ -1201,11 +1223,20 @@ def optimizer_completed(learner):
     return int(learner.agent.optimizer._timestep.numpy()[0]) if learner.native else rsl_steps(learner.agent)
 
 
-def evaluate_worker(args, spec):
+def evaluate_worker(
+    args,
+    spec,
+    *,
+    environment_factory=environment,
+    learner_factory=Learner,
+    fixture_validator=verify_fixtures,
+    episode_evaluator=evaluate_episode,
+    aggregate_metrics=evaluation_metrics,
+):
     import numpy as np
     import torch
 
-    fixture_metadata = verify_fixtures(args.fixtures, args.protocol)
+    fixture_metadata = fixture_validator(args.fixtures, args.protocol)
     training = json.loads((args.train_root / "train.json").read_text())
     require(training["status"] == "COMPLETED", "Cannot evaluate incomplete training")
     args.output.mkdir(parents=True, exist_ok=False)
@@ -1220,11 +1251,13 @@ def evaluate_worker(args, spec):
     }
     settings = spec["evaluation"]
     state = torch.load(args.fixtures / "evaluation-state.pt", map_location=args.device, weights_only=True)
-    with environment(args, spec, settings["episodes"], settings["common_seed"]) as (wrapper, metadata):
+    with environment_factory(args, spec, settings["episodes"], settings["common_seed"]) as (wrapper, metadata):
         result["environment"] = metadata
         wrapper.reset(seed=settings["common_seed"])
         started = time.perf_counter()
-        learner = Learner(args, spec, settings["episodes"], evaluation=True)
+        learner = learner_factory(
+            args, spec, settings["episodes"], wrapper.observation_dim, wrapper.action_dim, evaluation=True
+        )
         constructor_seconds = time.perf_counter() - started
         if args.recipe == "rsl_ppo":
             learner.agent.eval_mode()
@@ -1243,7 +1276,7 @@ def evaluate_worker(args, spec):
                 before == saved["model_hashes"], "Loaded policy state differs from the actual saved checkpoint model"
             )
             started = time.perf_counter()
-            values, hashes, observation_hash = evaluate_episode(learner, wrapper, state, settings)
+            values, hashes, observation_hash = episode_evaluator(learner, wrapper, state, settings)
             evaluation_seconds = time.perf_counter() - started
             require(
                 hashes == fixture_metadata["evaluation_state_hashes"],
@@ -1258,7 +1291,7 @@ def evaluate_worker(args, spec):
             filename = f"episodes-{saved['iteration']:04d}.npz"
             started = time.perf_counter()
             np.savez(args.output / filename, **values)
-            metrics = evaluation_metrics(values, settings)
+            metrics = aggregate_metrics(values, settings)
             require(finite(metrics), "Nonfinite evaluation aggregate")
             record = {
                 "iteration": saved["iteration"],
@@ -1295,10 +1328,10 @@ def evaluate_worker(args, spec):
     write_json(args.output / "evaluate.json", result)
 
 
-def worker_command(args, phase, recipe, seed, output, train_root=None):
+def worker_command(args, phase, recipe, seed, output, train_root=None, *, entrypoint=None):
     command = [
         sys.executable,
-        str(Path(__file__).resolve()),
+        str(Path(__file__).resolve() if entrypoint is None else entrypoint),
         phase,
         "--protocol",
         str(args.protocol),
@@ -1340,8 +1373,8 @@ def child(args, command, log):
     return record
 
 
-def controller(args, spec):
-    verify_fixtures(args.fixtures, args.protocol)
+def controller(args, spec, *, fixture_validator=verify_fixtures, entrypoint=None):
+    fixture_validator(args.fixtures, args.protocol)
     args.output.mkdir(parents=True, exist_ok=False)
     smoke = args.phase == "smoke"
     if not smoke:
@@ -1352,7 +1385,7 @@ def controller(args, spec):
             and prior["protocol_sha256"] == sha(args.protocol),
             "Production requires the completed selected-recipe smoke first",
         )
-    seeds = [0] if smoke else spec["budget"]["seeds"]
+    seeds = [0] if smoke else spec["schedule"][args.allocation].get("seeds", spec["budget"]["seeds"])
     schedule = []
     for seed in seeds:
         row_index = 0 if smoke else spec["schedule"][args.allocation]["williams_row_by_seed"][seed]
@@ -1388,14 +1421,16 @@ def controller(args, spec):
         run_root.mkdir(parents=True)
         train_root, eval_root = run_root / "train", run_root / "evaluate"
         train_process = child(
-            args, worker_command(args, "train-worker", recipe, seed, train_root), run_root / "train.log"
+            args,
+            worker_command(args, "train-worker", recipe, seed, train_root, entrypoint=entrypoint),
+            run_root / "train.log",
         )
         result["chronology"].append({**entry, "phase": "training", **train_process})
         write_json(destination, result)
         require(train_process["exit_code"] == 0, f"Training failed; retained log: {run_root / 'train.log'}")
         eval_process = child(
             args,
-            worker_command(args, "evaluate-worker", recipe, seed, eval_root, train_root),
+            worker_command(args, "evaluate-worker", recipe, seed, eval_root, train_root, entrypoint=entrypoint),
             run_root / "evaluate.log",
         )
         result["chronology"].append({**entry, "phase": "evaluation", **eval_process})
