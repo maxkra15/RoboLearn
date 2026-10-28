@@ -115,6 +115,7 @@ def read_spec(args):
         )
         name = checkpointing["continuation_directory_name"]
         require(name not in ("", ".", "..") and Path(name).name == name, "Unsafe continuation directory name")
+    replay_sample_indices(args, spec)
     return spec
 
 
@@ -134,6 +135,144 @@ def array_hash(value):
 
 def state_hashes(state):
     return {key: array_hash(value) for key, value in state.items()}
+
+
+def replay_sample_indices(args, spec):
+    """Read prespecified replay slots without consuming a training RNG stream."""
+    import numpy as np
+
+    checkpointing = spec.get("checkpointing", {})
+    settings = checkpointing.get("final_replay_sample", {})
+    if not settings.get("enabled", False):
+        return None
+    require(
+        spec["schedule"]["recipe_order"] == ["official_flashsac"]
+        and not checkpointing.get("full_replay_in_final_continuation_checkpoint", False)
+        and settings["iteration"] == spec["budget"]["iterations"]
+        and settings["iteration"] in spec["budget"]["checkpoint_iterations"],
+        "Bounded replay export requires the final official-only policy checkpoint without full replay export",
+    )
+    name = settings["indices_file"]
+    require(name not in ("", ".", "..") and Path(name).name == name, "Unsafe replay indices filename")
+    path = args.protocol.parent / name
+    require(sha(path) == settings["indices_file_sha256"], "Replay indices file differs from the protocol")
+    frozen = json.loads(path.read_text())
+    require(
+        frozen["population"] == settings["population"] == spec["recipes"]["official_flashsac"]["buffer_capacity"]
+        and len(frozen["batches"]) == settings["batches"] == len(settings["replay_index_seeds"])
+        and len(settings["indices_sha256"]) == settings["batches"]
+        and len(set(settings["replay_index_seeds"])) == settings["batches"]
+        and settings["tensor_fields"]
+        == ["observation", "next_observation", "action", "reward", "terminated", "truncated"]
+        and settings["tensor_dtype"] == "float32"
+        and settings["observation_dimensions"] == spec["mdp"]["observation_dimensions"]
+        and settings["action_dimensions"] == spec["mdp"]["action_dimensions"],
+        "Replay sample population or batch count differs",
+    )
+    for batch, seed, digest in zip(
+        frozen["batches"], settings["replay_index_seeds"], settings["indices_sha256"], strict=True
+    ):
+        require(all(type(value) is int for value in batch["indices"]), "Replay indices must be integers")
+        indices = np.asarray(batch["indices"], dtype=np.int64)
+        require(
+            batch["seed"] == seed
+            and indices.shape == (settings["batch_size"],)
+            and bool(((indices >= 0) & (indices < frozen["population"])).all())
+            and array_hash(indices) == batch["indices_sha256"] == digest,
+            "Replay sample indices differ from their frozen identity",
+        )
+    return settings, frozen["batches"]
+
+
+def export_replay_sample(learner, args, spec, iteration, transitions, saved):
+    """Archive owned sampled arrays, not the learning buffer or a resume checkpoint."""
+    import numpy as np
+    import torch
+
+    started = time.perf_counter()
+    settings, batches = replay_sample_indices(args, spec)
+    require(learner.recipe == "official_flashsac", "Only the pristine official replay sampler is supported")
+    buffer = learner.agent._replay_buffer
+    population, current = len(buffer), buffer._current_idx
+    pending = len(buffer._n_step_transitions)
+    require(
+        population == settings["population"]
+        and current == settings["expected_current_idx"]
+        and pending == learner.config["n_step"],
+        "Final live replay counters differ from the declared export",
+    )
+    cpu_rng, device_rng = torch.get_rng_state(), torch.cuda.get_rng_state(learner.device)
+    directory = args.output / "final-replay-sample"
+    directory.mkdir(parents=True, exist_ok=False)
+    record = {
+        "iteration": iteration,
+        "transitions": transitions,
+        "protocol_sha256": sha(args.protocol),
+        "source_commit": spec["source"]["robolearn_measured_commit"],
+        "path": str(directory.relative_to(args.output)),
+        "model_hashes": saved["model_hashes"],
+        "optimizer": saved["optimizer"],
+        "configuration": learner.config,
+        "flash_recipe_resolution": flash_recipe_settings(spec),
+        "num_envs": learner.num_envs,
+        "replay_num_in_buffer": population,
+        "replay_current_idx": current,
+        # The deque retains its oldest, already committed vector batch as well.
+        "replay_deque_length": pending,
+        "unsaved_pending_vector_steps": max(0, pending - 1),
+        "indices_file_sha256": settings["indices_file_sha256"],
+        "full_replay_included": False,
+        "resumable": False,
+        "scope": "Finite sampled slots only; unsampled storage, pending deque and global RNG are not archived",
+        "batches": [],
+    }
+    with learner.scope():
+        for batch in batches:
+            arrays = {"indices": np.asarray(batch["indices"], dtype=np.int64)}
+            # The authors' public sampler accepts explicit slots and does not draw RNG.
+            selected = buffer.sample(arrays["indices"])
+            require(set(selected) == set(settings["tensor_fields"]), "Unexpected official replay sample fields")
+            for key, tensor in selected.items():
+                array = tensor.detach().cpu().numpy().copy()
+                width = {
+                    "observation": settings["observation_dimensions"],
+                    "next_observation": settings["observation_dimensions"],
+                    "action": settings["action_dimensions"],
+                }.get(key)
+                shape = (settings["batch_size"], width) if width is not None else (settings["batch_size"],)
+                require(
+                    array.dtype == np.float32 and array.shape == shape and bool(np.isfinite(array).all()),
+                    f"Invalid sampled replay array: {key}",
+                )
+                arrays[key] = array
+            name = f"batch-{batch['seed']}.npz"
+            np.savez(directory / name, **arrays)
+            record["batches"].append(
+                {
+                    "seed": batch["seed"],
+                    "indices_sha256": batch["indices_sha256"],
+                    "file": name,
+                    "arrays": {
+                        key: {"dtype": str(value.dtype), "shape": list(value.shape), "sha256": array_hash(value)}
+                        for key, value in arrays.items()
+                    },
+                }
+            )
+    require(
+        (len(buffer), buffer._current_idx, len(buffer._n_step_transitions)) == (population, current, pending)
+        and state_hashes(learner.model()) == saved["model_hashes"]
+        and learner.counts() == saved["optimizer"]
+        and torch.equal(cpu_rng, torch.get_rng_state())
+        and torch.equal(device_rng, torch.cuda.get_rng_state(learner.device)),
+        "Replay sample export changed training state or RNG",
+    )
+    write_json(directory / "manifest.json", record)
+    files = sorted(directory.iterdir())
+    record["files_sha256"] = {path.name: sha(path) for path in files}
+    record["files_bytes"] = {path.name: path.stat().st_size for path in files}
+    record["write_seconds"] = time.perf_counter() - started
+    record["process_write_finished_seconds"] = time.perf_counter() - PROCESS_STARTED
+    return record
 
 
 def finite(value):
@@ -1088,6 +1227,12 @@ def train_worker(
                 )
                 if "continuation" in saved:
                     result["final_continuation"] = saved.pop("continuation")
+                sample = settings.get("final_replay_sample", {})
+                if not args.smoke and sample.get("enabled", False) and iteration == sample["iteration"] == iterations:
+                    result["final_replay_sample"] = export_replay_sample(
+                        learner, args, spec, iteration, transitions, saved
+                    )
+                    saved["write_seconds"] += result["final_replay_sample"]["write_seconds"]
                 timing["checkpoint_seconds"] += saved["write_seconds"]
                 result["checkpoints"].append(saved)
             record["iteration_seconds"] = time.perf_counter() - iteration_started
@@ -1173,7 +1318,7 @@ def train_worker(
         "collection_host_seconds": "Policy inference + public action API/CPU transfer + common action boundary + env.step + transition observe/insertion. Includes host waits; not pure physics.",
         "learning_host_seconds": "Actual optimizer/update API and scalar metrics; interleaved Flash calls excluded from collection section. Includes host waits.",
         "primary": "Synchronized iteration/whole-process wall; phase host/dispatch durations are not GPU-only timings and do not include the final iteration barrier.",
-        "nested": "Checkpoint/metrics IO are inside training_loop_seconds, including any final full-replay export. Portable policy availability timestamps precede that separate export. Preparation includes native kernel build, warmup and capture, but official lazy compilation remains in constructor/first collection/updates.",
+        "nested": "Checkpoint/metrics IO are inside training_loop_seconds, including any final full-replay or sampled-replay export. Portable policy availability timestamps precede that separate export. Preparation includes native kernel build, warmup and capture, but official lazy compilation remains in constructor/first collection/updates.",
     }
     write_json(args.output / "train.json", result)
 

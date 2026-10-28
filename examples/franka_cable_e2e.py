@@ -105,10 +105,14 @@ class CableLearner(core.Learner):
 
 
 def read_spec(args):
+    from _franka_cable_environment import policy_action_scale
+
     spec = json.loads(args.protocol.read_text())
     core.require(spec["mdp"]["task"] == "Isaac-Lift-Cable-Franka", "Expected the stock state based cable task")
     core.require(spec["mdp"]["action_boundary_clip"] is None, "The stock cable task uses unclipped policy actions")
     core.flash_recipe_settings(spec)
+    policy_action_scale(spec)
+    core.replay_sample_indices(args, spec)
     recipes = spec["schedule"]["recipe_order"]
     core.require(
         recipes and len(set(recipes)) == len(recipes) and set(recipes) <= set(core.RECIPES),

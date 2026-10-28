@@ -20,6 +20,24 @@ TASK = "Isaac-Lift-Cable-Franka"
 PHYSICS = "newton_mjwarp_vbd_proxy"
 
 
+def policy_action_scale(spec):
+    """Resolve scalar or coordinate gains without changing normalized replay actions."""
+    scalar = float(spec["mdp"].get("policy_action_scale", 1.0))
+    require(math.isfinite(scalar) and scalar > 0, "Policy action scale must be finite and positive")
+    vector = spec["mdp"].get("policy_action_scale_per_dimension")
+    if vector is not None:
+        require(scalar == 1.0, "Specify a unit scalar when using per-dimension action gains")
+        require(
+            len(vector) == spec["mdp"]["action_dimensions"]
+            and all(math.isfinite(value) and value > 0 for value in vector),
+            "Per-dimension action gains must match the action shape and be finite and positive",
+        )
+    effective = (
+        [float(value) for value in vector] if vector is not None else [scalar] * spec["mdp"]["action_dimensions"]
+    )
+    return scalar, vector, effective
+
+
 def _gravity(env):
     import warp as wp
 
@@ -66,6 +84,7 @@ class CableTrainingDiagnostics:
         from isaaclab.utils.math import quat_apply
 
         self.wrapper, self.settings = wrapper, spec["evaluation"]
+        self.gripper_action_scale = wrapper.action_scale if wrapper.action_scale.ndim == 0 else wrapper.action_scale[7]
         self.layout = observation_layout(wrapper.env)
         robot = wrapper.env.scene["robot"]
         self.fingers = [index for index, name in enumerate(robot.joint_names) if name.startswith("panda_finger_joint")]
@@ -80,6 +99,7 @@ class CableTrainingDiagnostics:
             "aggregation": "Means over num_envs*rollout_steps per iteration; ever fractions are worlds with any event in that iteration, not episode success rates",
             "state": "Raw replay next observations include pre-reset final states on done transitions; root pose is fixed",
             "gripper": "Opening sums relative finger observations plus their saved default joint positions; command is policy action 7 times the task gain, before the stock gripper mapping",
+            "effective_action_scale": policy_action_scale(spec)[2],
             "contact_or_grasp": "Not measured; goal/lift/finger geometry and commands are proxies, not contact or grasp proof",
             "cost": "GPU reductions inside collection; one host transfer at the existing iteration logging boundary",
         }
@@ -110,7 +130,7 @@ class CableTrainingDiagnostics:
         lifted = height > self.settings["lift_height_threshold_m"]
         begin, end = self.layout["joint_pos"]
         opening = (raw[:, begin:end][:, self.fingers] + self.finger_defaults).sum(-1)
-        command = transition["action"][:, 7] * self.wrapper.action_scale
+        command = transition["action"][:, 7] * self.gripper_action_scale
         values = (
             goal.float(),
             lifted.float(),
@@ -157,10 +177,10 @@ def build_environment(args, spec, num_envs, seed, evaluation=False):
 
     started = time.perf_counter()
     require(spec["mdp"]["task"] == TASK, "Expected the stock state-based Franka cable task")
-    action_scale = float(spec["mdp"].get("policy_action_scale", 1.0))
-    require(math.isfinite(action_scale) and action_scale > 0, "Policy action scale must be finite and positive")
+    action_scale, action_scale_vector, effective_action_scale = policy_action_scale(spec)
     require(
-        action_scale == 1.0 or args.recipe in (None, "official_flashsac", "cuda_flashsac"),
+        all(value == 1.0 for value in effective_action_scale)
+        or args.recipe in (None, "official_flashsac", "cuda_flashsac"),
         "Nonunit action gain is a separate SAC control, not a matched PPO recipe",
     )
     require(Path(ISAACLAB_ROOT).resolve() == args.isaaclab_root, "Isaac Lab root differs from the frozen checkout")
@@ -211,12 +231,18 @@ def build_environment(args, spec, num_envs, seed, evaluation=False):
         "full_cable_gravity_verified": False,
         "snapshot_scope": "scene, commands, targets, actions, clocks, gravity, sticky success; solver cold reset, not RNG continuation",
         "policy_action_scale": action_scale,
+        "policy_action_scale_per_dimension": action_scale_vector,
+        "effective_action_scale": effective_action_scale,
     }
     with launch_simulation(cfg):
         require(not cfg.sim.visualizer_cfgs, "Runtime preparation enabled an unexpected visualizer")
         env = gym.make(TASK, cfg=cfg).unwrapped
         try:
-            wrapper = IsaacLabEnv(env, clip_actions=None, action_scale=action_scale)
+            wrapper = IsaacLabEnv(
+                env,
+                clip_actions=None,
+                action_scale=action_scale if action_scale_vector is None else effective_action_scale,
+            )
             require((wrapper.observation_dim, wrapper.action_dim) == (69, 8), "Unexpected cable policy dimensions")
             require(env.scene["robot"].is_fixed_base, "Height reconstruction requires the stock fixed-base Franka")
             solver = env.sim.backend_manager.backend.solver

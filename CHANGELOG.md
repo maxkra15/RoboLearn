@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Allow explicit per-dimension cable action gains and bounded, prespecified final
+  replay exports while retaining portable optimizer checkpoints and full smoke replay.
 - Allow comparison protocols to select official multi-step FlashSAC returns and
   a full-budget learning-rate horizon, with optional stochastic cable collection
   diagnostics. Preserve existing one-step/fixed-schedule defaults and learner math.
