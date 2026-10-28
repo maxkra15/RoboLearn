@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Preserve the controller allocation in spawned training and evaluation workers.
 - Refresh the cable comparison for current Newton backend ownership, protocol
   allocation names and additional seeds with canonical smoke policies. Allow
   production-shaped smoke minibatches and replay warmup. Retain sparse FlashSAC

@@ -1365,6 +1365,8 @@ def worker_command(args, phase, recipe, seed, output, train_root=None, *, entryp
         phase,
         "--protocol",
         str(args.protocol),
+        "--allocation",
+        args.allocation,
         "--isaaclab-root",
         str(args.isaaclab_root),
         "--official-root",
