@@ -108,13 +108,14 @@ def read_spec(args):
     spec = json.loads(args.protocol.read_text())
     core.require(spec["mdp"]["task"] == "Isaac-Lift-Cable-Franka", "Expected the stock state based cable task")
     core.require(spec["mdp"]["action_boundary_clip"] is None, "The stock cable task uses unclipped policy actions")
-    core.require(spec["recipes"]["official_flashsac"]["n_step"] == 1, "Expected one-step timeout targets")
+    core.flash_recipe_settings(spec)
     recipes = spec["schedule"]["recipe_order"]
     core.require(
         recipes and len(set(recipes)) == len(recipes) and set(recipes) <= set(core.RECIPES),
         "Expected a nonempty unique selection of reviewed learners",
     )
     core.require(args.allocation in spec["schedule"], "Unknown allocation")
+    core.require(args.recipe is None or args.recipe in recipes, "Worker recipe is absent from the protocol")
     core.require(
         all(sorted(row) == list(range(len(recipes))) for row in spec["schedule"]["williams_rows"]),
         "Incomplete execution order",
@@ -208,7 +209,7 @@ def fixture(args, spec):
 
 
 def main():
-    from _franka_cable_environment import environment, evaluate_episode, evaluation_metrics
+    from _franka_cable_environment import CableTrainingDiagnostics, environment, evaluate_episode, evaluation_metrics
 
     args = core.parse_args(description=__doc__)
     try:
@@ -218,7 +219,13 @@ def main():
             if args.phase == "fixture":
                 fixture(args, spec)
             elif args.phase == "train-worker":
-                core.train_worker(args, spec, environment_factory=environment, **common)
+                core.train_worker(
+                    args,
+                    spec,
+                    environment_factory=environment,
+                    training_diagnostic_factory=CableTrainingDiagnostics,
+                    **common,
+                )
             elif args.phase == "evaluate-worker":
                 core.evaluate_worker(
                     args,

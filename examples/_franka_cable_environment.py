@@ -44,6 +44,103 @@ def observation_layout(env):
     return result
 
 
+class CableTrainingDiagnostics:
+    """Aggregate stochastic collection geometry; these proxies do not prove grasping."""
+
+    names = (
+        "goal_step_fraction",
+        "lift_step_fraction",
+        "goal_distance_m_mean",
+        "middle_height_m_mean",
+        "middle_height_gain_per_step_m_mean",
+        "finger_joint_opening_m_mean",
+        "task_gripper_command_mean",
+        "task_gripper_positive_command_fraction",
+        "worlds_ever_goal_fraction",
+        "worlds_ever_lift_fraction",
+        "middle_height_m_max",
+    )
+
+    def __init__(self, wrapper, spec):
+        import torch
+        from isaaclab.utils.math import quat_apply
+
+        self.wrapper, self.settings = wrapper, spec["evaluation"]
+        self.layout = observation_layout(wrapper.env)
+        robot = wrapper.env.scene["robot"]
+        self.fingers = [index for index, name in enumerate(robot.joint_names) if name.startswith("panda_finger_joint")]
+        require(len(self.fingers) == 2, "Expected two stock Franka finger joints")
+        self.finger_defaults = robot.data.default_joint_pos.torch[:, self.fingers].clone()
+        begin, end = self.layout["joint_pos"]
+        require(end - begin == len(robot.joint_names), "Joint observation order differs from robot joint order")
+        self.root = wrapper.env.scene.get_state(is_relative=True)["articulation"]["robot"]["root_pose"].clone()
+        self.quat_apply = quat_apply
+        self.scope = {
+            "sampling": "All stochastic collection transitions, including uniform warmup and autoreset episodes",
+            "aggregation": "Means over num_envs*rollout_steps per iteration; ever fractions are worlds with any event in that iteration, not episode success rates",
+            "state": "Raw replay next observations include pre-reset final states on done transitions; root pose is fixed",
+            "gripper": "Opening sums relative finger observations plus their saved default joint positions; command is policy action 7 times the task gain, before the stock gripper mapping",
+            "contact_or_grasp": "Not measured; goal/lift/finger geometry and commands are proxies, not contact or grasp proof",
+            "cost": "GPU reductions inside collection; one host transfer at the existing iteration logging boundary",
+        }
+        self.sums = torch.zeros(8, device=wrapper.env.device)
+        self.ever_goal = torch.zeros(wrapper.num_envs, dtype=torch.bool, device=wrapper.env.device)
+        self.ever_lift = torch.zeros_like(self.ever_goal)
+        self.maximum_height = torch.zeros((), device=wrapper.env.device)
+
+    def begin_iteration(self):
+        self.sums.zero_()
+        self.ever_goal.zero_()
+        self.ever_lift.zero_()
+        self.maximum_height.fill_(-float("inf"))
+        self.steps = 0
+
+    def observe(self, transition):
+        import torch
+
+        raw = transition["next_observation"]
+        begin, end = self.layout["cable_segment_positions"]
+        middle = raw[:, begin:end].reshape(-1, 12, 3)[:, self.settings["goal_segment_index"]]
+        previous = transition["observation"][:, begin:end].reshape(-1, 12, 3)[:, self.settings["goal_segment_index"]]
+        height = self.quat_apply(self.root[:, 3:], middle)[:, 2] + self.root[:, 2]
+        previous_height = self.quat_apply(self.root[:, 3:], previous)[:, 2] + self.root[:, 2]
+        begin, _end = self.layout["target_position"]
+        distance = (middle - raw[:, begin : begin + 3]).norm(dim=-1)
+        goal = distance < self.settings["success_threshold_m"]
+        lifted = height > self.settings["lift_height_threshold_m"]
+        begin, end = self.layout["joint_pos"]
+        opening = (raw[:, begin:end][:, self.fingers] + self.finger_defaults).sum(-1)
+        command = transition["action"][:, 7] * self.wrapper.action_scale
+        values = (
+            goal.float(),
+            lifted.float(),
+            distance,
+            height,
+            height - previous_height,
+            opening,
+            command,
+            (command > 0).float(),
+        )
+        self.sums += torch.stack([value.sum() for value in values])
+        self.ever_goal |= goal
+        self.ever_lift |= lifted
+        self.maximum_height.copy_(torch.maximum(self.maximum_height, height.max()))
+        self.steps += 1
+
+    def finish_iteration(self):
+        import torch
+
+        require(self.steps > 0, "No training transitions were observed")
+        values = torch.cat(
+            (
+                self.sums / (self.steps * self.wrapper.num_envs),
+                torch.stack((self.ever_goal.float().mean(), self.ever_lift.float().mean(), self.maximum_height)),
+            )
+        ).tolist()
+        require(all(math.isfinite(value) for value in values), "Nonfinite stochastic cable diagnostic")
+        return dict(zip(self.names, values, strict=True))
+
+
 @contextmanager
 def build_environment(args, spec, num_envs, seed, evaluation=False):
     """Yield (wrapper, environment, metadata), keeping simulation ownership local."""

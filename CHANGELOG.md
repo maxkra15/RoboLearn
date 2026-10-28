@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Allow comparison protocols to select official multi-step FlashSAC returns and
+  a full-budget learning-rate horizon, with optional stochastic cable collection
+  diagnostics. Preserve existing one-step/fixed-schedule defaults and learner math.
 - Preserve the controller allocation in spawned training and evaluation workers.
 - Refresh the cable comparison for current Newton backend ownership, protocol
   allocation names and additional seeds with canonical smoke policies. Allow

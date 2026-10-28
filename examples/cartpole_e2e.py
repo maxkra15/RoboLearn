@@ -13,6 +13,9 @@ RSL-RL executes its actual PPO implementation. FlashSAC executes the authors'
 unmodified agent (87edc906) or RoboLearn's experimental native implementation.
 Algorithm credit: Schulman et al., arXiv:1707.06347; Kim et al., arXiv:2604.04539.
 The driver owns experiment files; it adds no simulator dependency to the library.
+Protocols can select official multi-step replay and a full-budget LR horizon;
+native multi-step timeout semantics remain a separate comparison. Full-budget
+decay uses the declared production budget even during a short smoke.
 """
 
 from __future__ import annotations
@@ -56,13 +59,34 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+def flash_recipe_settings(spec):
+    """Resolve explicit replay and schedule choices without changing old defaults."""
+    settings = spec["recipes"]["official_flashsac"]
+    n_step = settings.get("n_step", 1)
+    require(type(n_step) is int and n_step > 0, "FlashSAC n_step must be a positive integer")
+    require(
+        n_step == 1 or spec["schedule"]["recipe_order"] == ["official_flashsac"],
+        "Multi-step official/native timeout discounts differ; select official FlashSAC alone for this recipe",
+    )
+    schedule = settings.get("learning_rate_schedule", "fixed")
+    require(schedule in ("fixed", "full_budget"), "Unknown FlashSAC learning-rate schedule")
+    decay = settings["learning_rate_decay_step"]
+    if schedule == "full_budget":
+        expected = (
+            spec["budget"]["iterations"]
+            * spec["budget"]["rollout_steps"]
+            * settings["critic_update_calls_per_vector_step_after_warmup"]
+        )
+        require(decay == expected, "Full-budget decay must match nominal vector steps times critic update calls")
+    require(type(decay) is int and decay > 0, "FlashSAC decay must be a positive update count")
+    return {"n_step": n_step, "learning_rate_schedule": schedule, "learning_rate_decay_step": decay}
+
+
 def read_spec(args):
     spec = json.loads(args.protocol.read_text())
     require(spec["mdp"]["task"] == "Isaac-Cartpole", "This example implements the reviewed manager Cartpole contract")
     require(spec["mdp"]["action_boundary_clip"] == [-1.0, 1.0], "The common action boundary must clip to [-1,1]")
-    require(
-        spec["recipes"]["official_flashsac"]["n_step"] == 1, "One-step replay is required for matched timeout targets"
-    )
+    flash_recipe_settings(spec)
     recipes = spec["schedule"]["recipe_order"]
     require(
         bool(recipes)
@@ -176,11 +200,12 @@ def flash_config(spec, seed, device, smoke=False):
     from robolearn.flashsac import FlashSACConfig
 
     settings = spec["recipes"]["official_flashsac"]
+    resolved = flash_recipe_settings(spec)
     return FlashSACConfig(
         device=device,
         seed=seed,
         gamma=settings["gamma"],
-        n_step=1,
+        n_step=resolved["n_step"],
         buffer_max_length=(
             spec.get("smoke", {}).get("flash_buffer_capacity", settings["buffer_capacity"])
             if smoke
@@ -194,7 +219,7 @@ def flash_config(spec, seed, device, smoke=False):
         sample_batch_size=(
             spec.get("smoke", {}).get("flash_sample_batch_size", 256) if smoke else settings["batch_size"]
         ),
-        learning_rate_decay_step=settings["learning_rate_decay_step"],
+        learning_rate_decay_step=resolved["learning_rate_decay_step"],
         use_compile=True,
         use_amp=True,
     )
@@ -835,7 +860,7 @@ def checkpoint(learner, args, iteration, transitions, loop_seconds, *, continuat
     return record
 
 
-def collect_iteration(learner, wrapper, observations, horizon, uniform_generator):
+def collect_iteration(learner, wrapper, observations, horizon, uniform_generator, *, task_diagnostics=None):
     """Time host API sections without extra per-step CUDA barriers."""
     import torch
 
@@ -849,6 +874,8 @@ def collect_iteration(learner, wrapper, observations, horizon, uniform_generator
         reward_manager = wrapper.env.reward_manager
         reward_terms = torch.zeros(len(reward_manager.active_terms), device=learner.device)
     metrics = {}
+    if task_diagnostics is not None:
+        task_diagnostics.begin_iteration()
     for step in range(horizon):
         started = time.perf_counter()
         with torch.no_grad():
@@ -866,6 +893,8 @@ def collect_iteration(learner, wrapper, observations, horizon, uniform_generator
             valid = torch.isfinite(actions).all()
             actions_finite = valid if isinstance(actions_finite, bool) else actions_finite & valid
             after, transition = wrapper.step(actions)
+            if task_diagnostics is not None:
+                task_diagnostics.observe(transition)
             if diagnostics:
                 policy_actions = transition["action"]
                 action_sums[0] += policy_actions.sum(dim=0)
@@ -914,6 +943,8 @@ def collect_iteration(learner, wrapper, observations, horizon, uniform_generator
         phases["mean_weighted_reward_terms"] = dict(
             zip(reward_manager.active_terms, (reward_terms / samples).tolist(), strict=True)
         )
+    if task_diagnostics is not None:
+        phases["training_cable_state"] = task_diagnostics.finish_iteration()
     return (
         observations,
         metrics,
@@ -937,7 +968,13 @@ def payload(directory):
 
 
 def train_worker(
-    args, spec, *, environment_factory=environment, learner_factory=Learner, fixture_validator=verify_fixtures
+    args,
+    spec,
+    *,
+    environment_factory=environment,
+    learner_factory=Learner,
+    fixture_validator=verify_fixtures,
+    training_diagnostic_factory=None,
 ):
     import numpy as np
     import torch
@@ -993,11 +1030,25 @@ def train_worker(
         require(not any(learner.counts()["completed"].values()), "Preparation left nonzero optimizer counters")
         result["initial_optimizer_state"] = learner.counts() if learner.is_ppo else fresh_optimizer_state(learner.agent)
         result["configuration"] = learner.config
+        if not learner.is_ppo:
+            result["flash_recipe_resolution"] = {
+                **flash_recipe_settings(spec),
+                "schedule_step_unit": "Each optimizer's attempted updates, including AMP skips",
+                "shared_horizon": "The same decay horizon is used by all three optimizers; actor/temperature run less often",
+                "timeout_bootstrap": "Official uses gamma**n_step; native uses the effective replay horizon",
+                "official_replay_pending_saved": False,
+                "maximum_unsaved_pending_vector_steps": learner.config["n_step"] - 1 if not learner.native else 0,
+            }
         result["official_source"] = learner.provenance
         result["fresh_after_prepare"] = learner.fresh()
         # Reset after all compilation/warmup, with no randomized episode progress.
         observations = wrapper.reset(seed=args.seed)
         uniform_generator = torch.Generator(device=args.device).manual_seed(args.seed + 90000)
+        task_diagnostics = None
+        if spec.get("diagnostics", {}).get("training_cable_state", False):
+            require(training_diagnostic_factory is not None, "No task-specific training diagnostic collector")
+            task_diagnostics = training_diagnostic_factory(wrapper, spec)
+            result["training_cable_state_scope"] = task_diagnostics.scope
         record = checkpoint(learner, args, 0, 0, 0.0)
         timing["checkpoint_seconds"] += record["write_seconds"]
         result["checkpoints"].append(record)
@@ -1006,7 +1057,7 @@ def train_worker(
         for iteration in range(1, iterations + 1):
             iteration_started = time.perf_counter()
             observations, metrics, phases = collect_iteration(
-                learner, wrapper, observations, horizon, uniform_generator
+                learner, wrapper, observations, horizon, uniform_generator, task_diagnostics=task_diagnostics
             )
             eligible_total += phases["eligible_update_vector_steps"]
             transitions = iteration * horizon * num_envs
@@ -1080,7 +1131,9 @@ def train_worker(
             learner.save(saved, replay=not learner.is_ppo)
             before_payload, before_counts = payload(saved), learner.counts()
             before_model = state_hashes(learner.model())
-            observations, _, _ = collect_iteration(learner, wrapper, observations, horizon, uniform_generator)
+            observations, _, _ = collect_iteration(
+                learner, wrapper, observations, horizon, uniform_generator, task_diagnostics=task_diagnostics
+            )
             perturbed_counts = learner.counts()
             require(
                 perturbed_counts["completed"]["critic"] > before_counts["completed"]["critic"],
@@ -1094,7 +1147,9 @@ def train_worker(
                 "Smoke native checkpoint/scaler reload mismatch",
             )
             require(before_counts == learner.counts(), "Smoke checkpoint counter mismatch")
-            observations, _, _ = collect_iteration(learner, wrapper, observations, horizon, uniform_generator)
+            observations, _, _ = collect_iteration(
+                learner, wrapper, observations, horizon, uniform_generator, task_diagnostics=task_diagnostics
+            )
             after_counts = learner.counts()
             require(
                 after_counts["completed"]["actor"] > before_counts["completed"]["actor"]
@@ -1289,6 +1344,9 @@ def evaluate_worker(
             args, spec, settings["episodes"], wrapper.observation_dim, wrapper.action_dim, evaluation=True
         )
         constructor_seconds = time.perf_counter() - started
+        if not learner.is_ppo:
+            result["configuration"] = learner.config
+            result["flash_recipe_resolution"] = flash_recipe_settings(spec)
         if args.recipe == "rsl_ppo":
             learner.agent.eval_mode()
         for saved in training["checkpoints"]:
