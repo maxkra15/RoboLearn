@@ -116,6 +116,10 @@ collection cost stays in the measured wall time. Sparse FlashSAC actor and
 temperature metrics retain their latest observed value within each iteration.
 Raw action magnitudes above one do not by themselves indicate actuator saturation.
 Smoke replay warmup and batch size are configurable independently of production.
+The optional `mdp.policy_action_scale` defaults to one. Nonunit gains are restricted
+to separate SAC controls: replay retains normalized policy actions, while the
+environment, last-action observation and action penalties see the scaled commands.
+Training action summaries use the replay/policy coordinates before that gain.
 
 ## Differentiable learning
 

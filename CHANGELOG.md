@@ -7,6 +7,8 @@
   production-shaped smoke minibatches and replay warmup. Retain sparse FlashSAC
   actor/temperature metrics and add optional training action/reward diagnostics
   without changing learner kernels or losses.
+- Expose an explicit policy action gain for separate cable SAC controls, retaining
+  normalized replay actions and the default unit-gain comparison.
 
 - Add a four-learner stock Franka cable comparison with common full-state
   evaluation, full cable gravity, and stock RSL observation normalization around

@@ -867,10 +867,10 @@ def collect_iteration(learner, wrapper, observations, horizon, uniform_generator
             actions_finite = valid if isinstance(actions_finite, bool) else actions_finite & valid
             after, transition = wrapper.step(actions)
             if diagnostics:
-                executed = transition["action"]
-                action_sums[0] += executed.sum(dim=0)
-                action_sums[1] += executed.square().sum(dim=0)
-                action_sums[2] += (executed.abs() > 1).sum(dim=0)
+                policy_actions = transition["action"]
+                action_sums[0] += policy_actions.sum(dim=0)
+                action_sums[1] += policy_actions.square().sum(dim=0)
+                action_sums[2] += (policy_actions.abs() > 1).sum(dim=0)
                 # This diagnostic buffer contains weighted rates; rewards include step_dt.
                 reward_terms += reward_manager._step_reward.sum(dim=0) * wrapper.env.step_dt
             reward_sum += transition["reward"].sum()

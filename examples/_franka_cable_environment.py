@@ -60,6 +60,12 @@ def build_environment(args, spec, num_envs, seed, evaluation=False):
 
     started = time.perf_counter()
     require(spec["mdp"]["task"] == TASK, "Expected the stock state-based Franka cable task")
+    action_scale = float(spec["mdp"].get("policy_action_scale", 1.0))
+    require(math.isfinite(action_scale) and action_scale > 0, "Policy action scale must be finite and positive")
+    require(
+        action_scale == 1.0 or args.recipe in (None, "official_flashsac", "cuda_flashsac"),
+        "Nonunit action gain is a separate SAC control, not a matched PPO recipe",
+    )
     require(Path(ISAACLAB_ROOT).resolve() == args.isaaclab_root, "Isaac Lab root differs from the frozen checkout")
     require(Path(isaaclab_tasks.__file__).resolve().is_relative_to(args.isaaclab_root), "Unexpected task import root")
     cfg = parse_env_cfg(
@@ -107,12 +113,13 @@ def build_environment(args, spec, num_envs, seed, evaluation=False):
         "evaluation_final_curriculum": evaluation,
         "full_cable_gravity_verified": False,
         "snapshot_scope": "scene, commands, targets, actions, clocks, gravity, sticky success; solver cold reset, not RNG continuation",
+        "policy_action_scale": action_scale,
     }
     with launch_simulation(cfg):
         require(not cfg.sim.visualizer_cfgs, "Runtime preparation enabled an unexpected visualizer")
         env = gym.make(TASK, cfg=cfg).unwrapped
         try:
-            wrapper = IsaacLabEnv(env, clip_actions=None)
+            wrapper = IsaacLabEnv(env, clip_actions=None, action_scale=action_scale)
             require((wrapper.observation_dim, wrapper.action_dim) == (69, 8), "Unexpected cable policy dimensions")
             require(env.scene["robot"].is_fixed_base, "Height reconstruction requires the stock fixed-base Franka")
             solver = env.sim.backend_manager.backend.solver
