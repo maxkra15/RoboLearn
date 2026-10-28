@@ -109,10 +109,15 @@ def read_spec(args):
     core.require(spec["mdp"]["task"] == "Isaac-Lift-Cable-Franka", "Expected the stock state based cable task")
     core.require(spec["mdp"]["action_boundary_clip"] is None, "The stock cable task uses unclipped policy actions")
     core.require(spec["recipes"]["official_flashsac"]["n_step"] == 1, "Expected one-step timeout targets")
-    core.require(spec["schedule"]["recipe_order"] == list(core.RECIPES), "Expected all four reviewed learners")
+    recipes = spec["schedule"]["recipe_order"]
+    core.require(
+        recipes and len(set(recipes)) == len(recipes) and set(recipes) <= set(core.RECIPES),
+        "Expected a nonempty unique selection of reviewed learners",
+    )
     core.require(args.allocation in spec["schedule"], "Unknown allocation")
     core.require(
-        all(sorted(row) == list(range(4)) for row in spec["schedule"]["williams_rows"]), "Incomplete execution order"
+        all(sorted(row) == list(range(len(recipes))) for row in spec["schedule"]["williams_rows"]),
+        "Incomplete execution order",
     )
     return spec
 
