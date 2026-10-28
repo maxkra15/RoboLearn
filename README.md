@@ -110,6 +110,13 @@ Its `fixture`, `smoke`, and `run` phases require an explicit frozen protocol,
 Isaac Lab checkout, upstream FlashSAC checkout, and output directory. These
 experiment helpers stay outside the installed learning library.
 
+The protocol can enable `diagnostics.training_actions_and_reward_terms` to record
+training action means/RMS by dimension and weighted reward contributions. Their
+collection cost stays in the measured wall time. Sparse FlashSAC actor and
+temperature metrics retain their latest observed value within each iteration.
+Raw action magnitudes above one do not by themselves indicate actuator saturation.
+Smoke replay warmup and batch size are configurable independently of production.
+
 ## Differentiable learning
 
 PPO already differentiates its policy and value networks. Using gradients through

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Refresh the cable comparison for current Newton backend ownership, protocol
+  allocation names and additional seeds with canonical smoke policies. Allow
+  production-shaped smoke minibatches and replay warmup. Retain sparse FlashSAC
+  actor/temperature metrics and add optional training action/reward diagnostics
+  without changing learner kernels or losses.
+
 - Add a four-learner stock Franka cable comparison with common full-state
   evaluation, full cable gravity, and stock RSL observation normalization around
   native PPO. Reuse collection, timing, and checkpoint audits without changing

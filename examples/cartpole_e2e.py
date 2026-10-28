@@ -186,8 +186,14 @@ def flash_config(spec, seed, device, smoke=False):
             if smoke
             else settings["buffer_capacity"]
         ),
-        buffer_min_length=512 if smoke else settings["buffer_warmup_transitions"],
-        sample_batch_size=256 if smoke else settings["batch_size"],
+        buffer_min_length=(
+            spec.get("smoke", {}).get("flash_buffer_warmup_transitions", 512)
+            if smoke
+            else settings["buffer_warmup_transitions"]
+        ),
+        sample_batch_size=(
+            spec.get("smoke", {}).get("flash_sample_batch_size", 256) if smoke else settings["batch_size"]
+        ),
         learning_rate_decay_step=settings["learning_rate_decay_step"],
         use_compile=True,
         use_amp=True,
@@ -837,6 +843,11 @@ def collect_iteration(learner, wrapper, observations, horizon, uniform_generator
     reward_sum = torch.zeros((), device=learner.device)
     terminated_sum = torch.zeros((), device=learner.device, dtype=torch.int64)
     truncated_sum = torch.zeros_like(terminated_sum)
+    diagnostics = learner.spec.get("diagnostics", {}).get("training_actions_and_reward_terms", False)
+    if diagnostics:
+        action_sums = torch.zeros((3, wrapper.action_dim), device=learner.device)
+        reward_manager = wrapper.env.reward_manager
+        reward_terms = torch.zeros(len(reward_manager.active_terms), device=learner.device)
     metrics = {}
     for step in range(horizon):
         started = time.perf_counter()
@@ -855,6 +866,13 @@ def collect_iteration(learner, wrapper, observations, horizon, uniform_generator
             valid = torch.isfinite(actions).all()
             actions_finite = valid if isinstance(actions_finite, bool) else actions_finite & valid
             after, transition = wrapper.step(actions)
+            if diagnostics:
+                executed = transition["action"]
+                action_sums[0] += executed.sum(dim=0)
+                action_sums[1] += executed.square().sum(dim=0)
+                action_sums[2] += (executed.abs() > 1).sum(dim=0)
+                # This diagnostic buffer contains weighted rates; rewards include step_dt.
+                reward_terms += reward_manager._step_reward.sum(dim=0) * wrapper.env.step_dt
             reward_sum += transition["reward"].sum()
             terminated_sum += transition["terminated"].sum()
             truncated_sum += transition["truncated"].sum()
@@ -869,7 +887,8 @@ def collect_iteration(learner, wrapper, observations, horizon, uniform_generator
             for _ in range(
                 learner.spec["recipes"]["official_flashsac"]["critic_update_calls_per_vector_step_after_warmup"]
             ):
-                metrics = learner.update()
+                # Actor/temperature update less often; keep their latest observed metrics.
+                metrics.update(learner.update())
             learning += time.perf_counter() - started
     if learner.is_ppo:
         started = time.perf_counter()
@@ -877,17 +896,28 @@ def collect_iteration(learner, wrapper, observations, horizon, uniform_generator
         learning += time.perf_counter() - started
     torch.cuda.synchronize(learner.device)
     require(bool(actions_finite.item()), "Nonfinite collection action")
+    samples = horizon * wrapper.num_envs
+    phases = {
+        "collection_host_seconds": collection,
+        "learning_host_seconds": learning,
+        "eligible_update_vector_steps": eligible,
+        "mean_transition_reward": float(reward_sum.item()) / samples,
+        "terminated_episodes": int(terminated_sum.item()),
+        "truncated_episodes": int(truncated_sum.item()),
+    }
+    if diagnostics:
+        phases["training_actions"] = {
+            "mean": (action_sums[0] / samples).tolist(),
+            "rms": (action_sums[1] / samples).sqrt().tolist(),
+            "abs_gt_one_fraction": (action_sums[2] / samples).tolist(),
+        }
+        phases["mean_weighted_reward_terms"] = dict(
+            zip(reward_manager.active_terms, (reward_terms / samples).tolist(), strict=True)
+        )
     return (
         observations,
         metrics,
-        {
-            "collection_host_seconds": collection,
-            "learning_host_seconds": learning,
-            "eligible_update_vector_steps": eligible,
-            "mean_transition_reward": float(reward_sum.item()) / (horizon * wrapper.num_envs),
-            "terminated_episodes": int(terminated_sum.item()),
-            "truncated_episodes": int(truncated_sum.item()),
-        },
+        phases,
     )
 
 
@@ -1456,8 +1486,8 @@ def controller(args, spec, *, fixture_validator=verify_fixtures, entrypoint=None
     write_json(destination, result)
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__)
+def parse_args(description=None):
+    parser = argparse.ArgumentParser(description=description or __doc__)
     parser.add_argument("phase", choices=("fixture", "smoke", "run", "train-worker", "evaluate-worker"))
     parser.add_argument("--protocol", type=Path, required=True)
     parser.add_argument(
@@ -1474,7 +1504,7 @@ def parse_args():
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--fixtures", type=Path)
-    parser.add_argument("--allocation", choices=("A", "B"), default="A")
+    parser.add_argument("--allocation", default="A", help="Allocation key in the protocol schedule")
     parser.add_argument("--recipe", choices=RECIPES)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda:0")

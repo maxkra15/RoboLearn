@@ -136,7 +136,8 @@ def fixture(args, spec):
     metadata = {"status": "PREPARING", "runtime": core.runtime(args), "policies": {}}
     module, metadata["official_source"] = import_official(args.official_root)
     observations, actions = spec["mdp"]["observation_dimensions"], spec["mdp"]["action_dimensions"]
-    for seed in spec["budget"]["seeds"]:
+    # The shared smoke uses seed zero even when production uses new seed cohorts.
+    for seed in sorted({0, *spec["budget"]["seeds"]}):
         torch.manual_seed(seed)
         ppo = core.make_rsl(1, observations, actions, "cpu", core.stock_config(spec["mdp"]["task"]))
         ppo_state = model_arrays(ppo)
@@ -204,7 +205,7 @@ def fixture(args, spec):
 def main():
     from _franka_cable_environment import environment, evaluate_episode, evaluation_metrics
 
-    args = core.parse_args()
+    args = core.parse_args(description=__doc__)
     try:
         spec = read_spec(args)
         common = {"learner_factory": CableLearner, "fixture_validator": verify_fixtures}
