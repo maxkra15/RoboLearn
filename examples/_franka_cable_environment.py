@@ -23,7 +23,7 @@ PHYSICS = "newton_mjwarp_vbd_proxy"
 def _gravity(env):
     import warp as wp
 
-    return wp.to_torch(env.sim.backend_manager.get_model().gravity)
+    return wp.to_torch(env.sim.backend_manager.backend.model.gravity)
 
 
 def observation_layout(env):
@@ -115,7 +115,7 @@ def build_environment(args, spec, num_envs, seed, evaluation=False):
             wrapper = IsaacLabEnv(env, clip_actions=None)
             require((wrapper.observation_dim, wrapper.action_dim) == (69, 8), "Unexpected cable policy dimensions")
             require(env.scene["robot"].is_fixed_base, "Height reconstruction requires the stock fixed-base Franka")
-            solver = env.sim.backend_manager._solver
+            solver = env.sim.backend_manager.backend.solver
             entries = {
                 name: {
                     "view_body_count": int(solver.view(name).body_count),
