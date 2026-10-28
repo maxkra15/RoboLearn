@@ -957,7 +957,7 @@ def train_worker(
     }
     write_json(args.output / "train.json", result)
 
-    num_envs = 64 if args.smoke else spec["mdp"]["num_envs"]
+    num_envs = spec.get("smoke", {}).get("num_envs", 64) if args.smoke else spec["mdp"]["num_envs"]
     iterations = 8 if args.smoke else spec["budget"]["iterations"]
     checkpoints = [0, iterations] if args.smoke else spec["budget"]["checkpoint_iterations"]
     horizon = spec["budget"]["rollout_steps"]
